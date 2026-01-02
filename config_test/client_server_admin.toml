@@ -1,0 +1,7 @@
+[connection]
+id = "local"
+server_address = "http://127.0.0.1:50051"
+
+[auth]
+shared_key = "1a2b3c4d5e6f1234567890abcdef12341a2b3c4d5e6f1234567890abcdef1234"
+admin_key = "1a2b3c4d5e6f1234567890abcdef12351a2b3c4d5e6f1234567890abcdef1235"

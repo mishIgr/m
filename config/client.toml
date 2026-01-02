@@ -1,0 +1,5 @@
+[storage]
+db_path = "~/.local/share/m/client.redb"
+
+[logging]
+path = "~/.local/share/m/client-logs/"

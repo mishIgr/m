@@ -1,0 +1,120 @@
+syntax = "proto3";
+package messenger;
+
+message Envelope {
+    bytes data = 1;
+}
+
+service Messenger {
+    rpc CreateChat(Envelope) returns (Envelope);
+    rpc DeleteChat(Envelope) returns (Envelope);
+    rpc ListChats(Envelope) returns (Envelope);
+    rpc SendMessage(Envelope) returns (Envelope);
+    rpc GetHistory(Envelope) returns (Envelope);
+    rpc Channel(stream Envelope) returns (stream Envelope);
+}
+
+message CreateChatRequest {
+    bytes admin_key = 1;
+    string chat_id = 2;
+    uint32 max_messages = 3;
+    uint64 max_bytes = 4;
+}
+
+message CreateChatResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message DeleteChatRequest {
+    bytes admin_key = 1;
+    string chat_id = 2;
+}
+
+message DeleteChatResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ListChatsRequest {
+    bytes admin_key = 1;
+}
+
+message ListChatsResponse {
+    repeated ChatInfo chats = 1;
+}
+
+message ChatInfo {
+    string chat_id = 1;
+    uint64 latest_timestamp_ms = 2;
+    uint64 earliest_timestamp_ms = 3;
+}
+
+message SendMessageRequest {
+    string chat_id = 1;
+    string message_id = 2;
+    bytes encrypted_payload = 3;
+}
+
+message SendMessageResponse {
+    bool accepted = 1;
+    uint64 timestamp_ms = 2;
+    string error = 3;
+}
+
+message GetHistoryRequest {
+    string chat_id = 1;
+    uint64 from_timestamp_ms = 2;
+    uint64 to_timestamp_ms = 3;
+    uint32 limit = 4;
+}
+
+message GetHistoryResponse {
+    repeated ChatMessage messages = 1;
+}
+
+message ClientEvent {
+    oneof event {
+        SubscribeRequest subscribe = 1;
+        MessageAck ack = 2;
+    }
+}
+
+message SubscribeRequest {
+    repeated ChatSubscription chats = 1;
+}
+
+message ChatSubscription {
+    string chat_id = 1;
+    uint64 latest_timestamp_ms = 2;
+}
+
+message MessageAck {
+    string chat_id = 1;
+    uint64 timestamp_ms = 2;
+}
+
+message ServerEvent {
+    oneof event {
+        ChatMessage message = 1;
+        SyncComplete sync_complete = 2;
+        ErrorEvent error = 3;
+    }
+}
+
+message ChatMessage {
+    string chat_id = 1;
+    string message_id = 2;
+    int64 timestamp_ms = 3;
+    bytes encrypted_payload = 4;
+}
+
+message SyncComplete {
+    string chat_id = 1;
+    uint64 synced_up_timestamp_ms = 2;
+}
+
+message ErrorEvent {
+    string code = 1;
+    string message = 2;
+}
