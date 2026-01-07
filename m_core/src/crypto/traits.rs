@@ -17,7 +17,7 @@ pub trait Mac: CryptoAlgorithm {
 
     type Key;
 
-    fn generate_key(&mut self);
+    fn regenerate_key(&mut self);
     fn set_key(&mut self, key: Self::Key);
     fn get_key(&self) -> Self::Key;
 
@@ -30,9 +30,9 @@ pub trait SymmetricCipher: CryptoAlgorithm {
 
     type Key;
     
-    fn generate_key(&mut self);
+    fn regenerate_key(&mut self);
     fn set_key(&mut self, key: Self::Key);
-    fn get_key(&self) -> Self::Key;
+    fn get_key(&self) -> &Self::Key;
 }
 
 pub trait SymmetricEncryption: SymmetricCipher {
@@ -60,7 +60,7 @@ pub trait AsymmetricCipher: CryptoAlgorithm {
 
     type KeyPair;
     
-    fn generate_keypair(&mut self);
+    fn regenerate_keypair(&mut self);
     fn set_keypair(&mut self, keypair: Self::KeyPair);
     fn get_keypair(&self) -> &Self::KeyPair;
 }
