@@ -1,4 +1,4 @@
-use crate::crypto::utils::{Result, CryptoError};
+use crate::crypto::utils::{CryptoResult, CryptoError};
 use crate::crypto::traits::{CryptoAlgorithm, Hash};
 
 pub struct Blake3Hash {
@@ -10,7 +10,7 @@ impl CryptoAlgorithm for Blake3Hash {
 }
 
 impl Hash for Blake3Hash {
-    fn new(output_size: usize) -> Result<Self> {
+    fn new(output_size: usize) -> CryptoResult<Self> {
         if output_size == 0 {
             return Err(CryptoError::new("BLAKE3 output size must be greater than 0"));
         }
@@ -22,7 +22,7 @@ impl Hash for Blake3Hash {
         self.output_size
     }
 
-    fn hash(&self, data: &[u8]) -> Result<Vec<u8>> {
+    fn hash(&self, data: &[u8]) -> CryptoResult<Vec<u8>> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(data);
         
@@ -33,7 +33,7 @@ impl Hash for Blake3Hash {
         Ok(output)
     }
 
-    fn hash_to(&self, data: &[u8], output: &mut [u8]) -> Result<()> {
+    fn hash_to(&self, data: &[u8], output: &mut [u8]) -> CryptoResult<()> {
         if output.len() != self.output_size {
             return Err(CryptoError::new(format!(
                 "Output buffer size mismatch: expected {}, got {}",
@@ -66,8 +66,8 @@ mod tests {
         for size in [16, 32, 64, 128, 256, 512, 1024] {
             let hash = Blake3Hash::new(size).unwrap();
             let data = b"BLAKE3 variable test";
-            let result = hash.hash(data).unwrap();
-            assert_eq!(result.len(), size);
+            let crypto_result = hash.hash(data).unwrap();
+            assert_eq!(crypto_result.len(), size);
         }
     }
 
@@ -75,9 +75,9 @@ mod tests {
     fn test_blake3_deterministic() {
         let hash = Blake3Hash::new(64).unwrap();
         let data = b"Test data";
-        let result1 = hash.hash(data).unwrap();
-        let result2 = hash.hash(data).unwrap();
-        assert_eq!(result1, result2);
+        let crypto_result1 = hash.hash(data).unwrap();
+        let crypto_result2 = hash.hash(data).unwrap();
+        assert_eq!(crypto_result1, crypto_result2);
     }
 
     #[test]

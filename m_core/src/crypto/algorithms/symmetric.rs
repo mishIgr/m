@@ -1,4 +1,4 @@
-use crate::crypto::utils::{Result, CryptoError, Key};
+use crate::crypto::utils::{CryptoResult, CryptoError, SecretKey};
 use crate::crypto::traits::{CryptoAlgorithm, SymmetricCipher, SymmetricEncryption};
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
@@ -10,7 +10,7 @@ use rand::RngCore;
 macro_rules! impl_aes_gcm {
     ($name:ident, $impl_type:ty, $key_size:expr, $display_name:expr) => {
         pub struct $name {
-            key: Key<$key_size>,
+            key: SecretKey<$key_size>,
         }
 
         impl CryptoAlgorithm for $name {
@@ -19,17 +19,17 @@ macro_rules! impl_aes_gcm {
 
         impl SymmetricCipher for $name {
             const KEY_SIZE: usize = $key_size;
-            type Key = Key<$key_size>;
+            type SecretKey = SecretKey<$key_size>;
 
             fn regenerate_key(&mut self) {
-                rand::rng().fill_bytes(&mut self.key);
+                rand::rng().fill_bytes(self.key.as_mut_bytes());
             }
 
-            fn set_key(&mut self, key: Self::Key) {
+            fn set_key(&mut self, key: Self::SecretKey) {
                 self.key = key;
             }
 
-            fn get_key(&self) -> &Self::Key {
+            fn get_key(&self) -> &Self::SecretKey {
                 &self.key
             }
         }
@@ -43,7 +43,7 @@ macro_rules! impl_aes_gcm {
                 nonce: &[u8],
                 plaintext: &[u8],
                 associated_data: &[u8],
-            ) -> Result<Vec<u8>> {
+            ) -> CryptoResult<Vec<u8>> {
                 if nonce.len() != Self::NONCE_SIZE {
                     return Err(CryptoError::new(format!(
                         "Invalid nonce size: expected {}, got {}",
@@ -52,7 +52,7 @@ macro_rules! impl_aes_gcm {
                     )));
                 }
 
-                let cipher = <$impl_type>::new_from_slice(&self.key)
+                let cipher = <$impl_type>::new_from_slice(self.key.as_bytes())
                     .map_err(|e| CryptoError::new(format!("Failed to create cipher: {:?}", e)))?;
 
                 let nonce_array = Nonce::from_slice(nonce);
@@ -72,7 +72,7 @@ macro_rules! impl_aes_gcm {
                 nonce: &[u8],
                 ciphertext: &[u8],
                 associated_data: &[u8],
-            ) -> Result<Vec<u8>> {
+            ) -> CryptoResult<Vec<u8>> {
                 if nonce.len() != Self::NONCE_SIZE {
                     return Err(CryptoError::new(format!(
                         "Invalid nonce size: expected {}, got {}",
@@ -88,7 +88,7 @@ macro_rules! impl_aes_gcm {
                     )));
                 }
 
-                let cipher = <$impl_type>::new_from_slice(&self.key)
+                let cipher = <$impl_type>::new_from_slice(self.key.as_bytes())
                     .map_err(|e| CryptoError::new(format!("Failed to create cipher: {:?}", e)))?;
 
                 let nonce_array = Nonce::from_slice(nonce);
@@ -114,11 +114,11 @@ macro_rules! impl_aes_gcm {
             pub fn new() -> Self {
                 let mut key = [0u8; $key_size];
                 rand::rng().fill_bytes(&mut key);
-                Self { key }
+                Self { key: key.into() }
             }
 
-            pub fn from_key(key: Key<$key_size>) -> Self {
-                Self { key }
+            pub fn from_key(key: [u8; $key_size]) -> Self {
+                Self { key: key.into() }
             }
 
             pub fn generate_nonce() -> [u8; Self::NONCE_SIZE] {
@@ -185,9 +185,9 @@ mod tests {
                     let aad = b"";
 
                     let ciphertext = cipher.encrypt(&nonce1, plaintext, aad).unwrap();
-                    let result = cipher.decrypt(&nonce2, &ciphertext, aad);
+                    let crypto_result = cipher.decrypt(&nonce2, &ciphertext, aad);
 
-                    assert!(result.is_err());
+                    assert!(crypto_result.is_err());
                 }
 
                 #[test]
@@ -199,9 +199,9 @@ mod tests {
                     let aad2 = b"wrong aad";
 
                     let ciphertext = cipher.encrypt(&nonce, plaintext, aad1).unwrap();
-                    let result = cipher.decrypt(&nonce, &ciphertext, aad2);
+                    let crypto_result = cipher.decrypt(&nonce, &ciphertext, aad2);
 
-                    assert!(result.is_err());
+                    assert!(crypto_result.is_err());
                 }
 
                 #[test]
@@ -214,8 +214,8 @@ mod tests {
                     let mut ciphertext = cipher.encrypt(&nonce, plaintext, aad).unwrap();
                     ciphertext[0] ^= 1;
 
-                    let result = cipher.decrypt(&nonce, &ciphertext, aad);
-                    assert!(result.is_err());
+                    let crypto_result = cipher.decrypt(&nonce, &ciphertext, aad);
+                    assert!(crypto_result.is_err());
                 }
 
                 #[test]
@@ -225,14 +225,14 @@ mod tests {
                     let plaintext = b"test";
                     let aad = b"";
 
-                    let result = cipher.encrypt(&invalid_nonce, plaintext, aad);
-                    assert!(result.is_err());
+                    let crypto_result = cipher.encrypt(&invalid_nonce, plaintext, aad);
+                    assert!(crypto_result.is_err());
                 }
 
                 #[test]
                 fn [<test_ $variant:lower _key_operations>]() {
                     let cipher1 = $variant::new();
-                    let key = *cipher1.get_key();
+                    let key = cipher1.get_key().clone();
 
                     let mut cipher2 = $variant::new();
                     cipher2.set_key(key);
@@ -250,12 +250,12 @@ mod tests {
                 #[test]
                 fn [<test_ $variant:lower _regenerate_key>]() {
                     let mut cipher = $variant::new();
-                    let old_key = *cipher.get_key();
+                    let old_key = cipher.get_key().clone();
 
                     cipher.regenerate_key();
-                    let new_key = *cipher.get_key();
+                    let new_key = cipher.get_key().clone();
 
-                    assert_ne!(old_key, new_key);
+                    assert!(!old_key.eq(&new_key));
                 }
 
                 #[test]
@@ -276,7 +276,7 @@ mod tests {
                     let key = [0x42u8; $variant::KEY_SIZE];
                     let cipher = $variant::from_key(key);
 
-                    assert_eq!(*cipher.get_key(), key);
+                    assert_eq!(*cipher.get_key().as_bytes(), key);
 
                     let nonce = $variant::generate_nonce();
                     let plaintext = b"test";

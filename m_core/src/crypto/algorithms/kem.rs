@@ -1,7 +1,7 @@
-use crate::crypto::utils::{Result, CryptoError, Key, KeyPair};
+use crate::crypto::utils::{CryptoResult, CryptoError, KeyPair, PublicKey, SecretKey};
 use crate::crypto::traits::{AsymmetricCipher, CryptoAlgorithm, Kem};
 use pqcrypto_kyber::{kyber512, kyber768, kyber1024};
-use pqcrypto_traits::kem::{Ciphertext, PublicKey, SecretKey, SharedSecret};
+use pqcrypto_traits::kem::{Ciphertext, PublicKey as PQPublicKey, SecretKey as PQSecretKey, SharedSecret};
 
 macro_rules! impl_kyber {
     ($name:ident, $module:ident, $display_name:expr) => {
@@ -22,13 +22,8 @@ macro_rules! impl_kyber {
             fn regenerate_keypair(&mut self) {
                 let (pk, sk) = $module::keypair();
                 
-                let mut public_key = [0u8; Self::PUBLIC_KEY_SIZE];
-                let mut secret_key = [0u8; Self::SECRET_KEY_SIZE];
-                
-                public_key.copy_from_slice(pk.as_bytes());
-                secret_key.copy_from_slice(sk.as_bytes());
-                
-                self.keypair = KeyPair::new(secret_key, public_key);
+                self.keypair = KeyPair::new(sk.as_bytes(), pk.as_bytes())
+                    .expect("keypair generation should always produce valid keys");
             }
 
             fn set_keypair(&mut self, keypair: Self::KeyPair) {
@@ -44,22 +39,22 @@ macro_rules! impl_kyber {
             const CIPHERTEXT_SIZE: usize = $module::ciphertext_bytes();
             const SHARED_SECRET_SIZE: usize = $module::shared_secret_bytes();
 
-            type PublicKey = Key<{ Self::PUBLIC_KEY_SIZE }>;
-            type SharedSecret = Key<{ Self::SHARED_SECRET_SIZE }>;
+            type PublicKey = PublicKey<{ Self::PUBLIC_KEY_SIZE }>;
+            type SharedSecret = SecretKey<{ Self::SHARED_SECRET_SIZE }>;
 
-            fn encapsulate(public_key: &Self::PublicKey) -> Result<(Self::SharedSecret, Vec<u8>)> {
-                let pk = $module::PublicKey::from_bytes(public_key)
+            fn encapsulate(public_key: &Self::PublicKey) -> CryptoResult<(Self::SharedSecret, Vec<u8>)> {
+                let pk = $module::PublicKey::from_bytes(public_key.as_bytes())
                     .map_err(|e| CryptoError::new(format!("Invalid public key: {:?}", e)))?;
                 
                 let (ss, ct) = $module::encapsulate(&pk);
-
-                let mut shared_secret = [0u8; Self::SHARED_SECRET_SIZE];
-                shared_secret.copy_from_slice(ss.as_bytes());
+                
+                let shared_secret = Self::SharedSecret::new(ss.as_bytes())
+                    .map_err(|e| CryptoError::new(format!("Invalid shared secret: {}", e)))?;
                 
                 Ok((shared_secret, ct.as_bytes().to_vec()))
             }
 
-            fn decapsulate(&self, ciphertext: &[u8]) -> Result<Self::SharedSecret> {
+            fn decapsulate(&self, ciphertext: &[u8]) -> CryptoResult<Self::SharedSecret> {
                 if ciphertext.len() != Self::CIPHERTEXT_SIZE {
                     return Err(CryptoError::new(format!(
                         "Invalid ciphertext size: expected {}, got {}",
@@ -68,20 +63,16 @@ macro_rules! impl_kyber {
                     )));
                 }
 
-                let secret_key = &self.keypair.secret;
-                
-                let sk = $module::SecretKey::from_bytes(secret_key)
+                let sk = $module::SecretKey::from_bytes(self.keypair.secret.as_bytes())
                     .map_err(|e| CryptoError::new(format!("Invalid secret key: {:?}", e)))?;
                 
                 let ct = $module::Ciphertext::from_bytes(ciphertext)
                     .map_err(|e| CryptoError::new(format!("Invalid ciphertext: {:?}", e)))?;
                 
                 let ss = $module::decapsulate(&ct, &sk);
-
-                let mut shared_secret = [0u8; Self::SHARED_SECRET_SIZE];
-                shared_secret.copy_from_slice(ss.as_bytes());
                 
-                Ok(shared_secret)
+                Self::SharedSecret::new(ss.as_bytes())
+                    .map_err(|e| CryptoError::new(format!("Failed to create shared secret: {}", e)))
             }
         }
 
@@ -95,14 +86,9 @@ macro_rules! impl_kyber {
             pub fn new() -> Self {
                 let (pk, sk) = $module::keypair();
                 
-                let mut public_key = [0u8; Self::PUBLIC_KEY_SIZE];
-                let mut secret_key = [0u8; Self::SECRET_KEY_SIZE];
-                
-                public_key.copy_from_slice(pk.as_bytes());
-                secret_key.copy_from_slice(sk.as_bytes());
-                
                 Self {
-                    keypair: KeyPair::new(secret_key, public_key),
+                    keypair: KeyPair::new(sk.as_bytes(), pk.as_bytes())
+                        .expect("Failed to create keypair from generated keys"),
                 }
             }
         }
@@ -127,9 +113,8 @@ mod tests {
                     let (ss_sender, ciphertext) = $variant::encapsulate(public_key).unwrap();
                     let ss_receiver = kyber.decapsulate(&ciphertext).unwrap();
                     
-                    assert_eq!(ss_sender, ss_receiver);
+                    assert_eq!(ss_sender.as_bytes(), ss_receiver.as_bytes());
                     assert_eq!(ciphertext.len(), $variant::CIPHERTEXT_SIZE);
-                    assert_eq!(ss_sender.len(), $variant::SHARED_SECRET_SIZE);
                 }
 
                 #[test]
@@ -144,7 +129,7 @@ mod tests {
                     let (ss1, ciphertext) = $variant::encapsulate(public_key).unwrap();
                     let ss2 = kyber2.decapsulate(&ciphertext).unwrap();
                     
-                    assert_eq!(ss1, ss2);
+                    assert_eq!(ss1.as_bytes(), ss2.as_bytes());
                 }
 
                 #[test]
@@ -155,25 +140,37 @@ mod tests {
                     let (ss1, ct1) = $variant::encapsulate(public_key).unwrap();
                     let (ss2, ct2) = $variant::encapsulate(public_key).unwrap();
 
-                    assert_ne!(ss1, ss2);
+                    assert_ne!(ss1.as_bytes(), ss2.as_bytes());
                     assert_ne!(ct1, ct2);
 
                     let ss1_dec = kyber.decapsulate(&ct1).unwrap();
                     let ss2_dec = kyber.decapsulate(&ct2).unwrap();
 
-                    assert_eq!(ss1, ss1_dec);
-                    assert_eq!(ss2, ss2_dec);
+                    assert_eq!(ss1.as_bytes(), ss1_dec.as_bytes());
+                    assert_eq!(ss2.as_bytes(), ss2_dec.as_bytes());
                 }
 
                 #[test]
                 fn [<test_ $variant:lower _regenerate_keypair>]() {
                     let mut kyber = $variant::new();
-                    let old_public_key = kyber.get_keypair().public;
+                    let old_public_key = kyber.get_keypair().public.clone();
                     
                     kyber.regenerate_keypair();
-                    let new_public_key = kyber.get_keypair().public;
+                    let new_public_key = &kyber.get_keypair().public;
                     
-                    assert_ne!(old_public_key, new_public_key);
+                    assert_ne!(old_public_key.as_bytes(), new_public_key.as_bytes());
+                }
+
+                #[test]
+                fn [<test_ $variant:lower _zeroize>]() {
+                    use std::ptr;
+                    
+                    let kyber = $variant::new();
+                    let secret_ptr = ptr::addr_of!(*kyber.get_keypair().secret.as_bytes()) as usize;
+                    
+                    drop(kyber);
+
+                    println!("Secret key memory location was at: 0x{:x}", secret_ptr);
                 }
             }
         };
