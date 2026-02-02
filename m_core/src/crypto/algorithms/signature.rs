@@ -1,12 +1,13 @@
-use crate::crypto::utils::{CryptoResult, CryptoError, KeyPair, PublicKey};
-use crate::crypto::traits::{AsymmetricCipher, CryptoAlgorithm, Signature};
+use crate::crypto::{CryptoResult, CryptoKey, AsymmetricCipher, CryptoAlgorithm, Signature, CryptoError};
+use crate::crypto::key::Key;
 use pqcrypto_dilithium::{dilithium2, dilithium3, dilithium5};
 use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SecretKey as PQSecretKey, SignedMessage, DetachedSignature};
 
 macro_rules! impl_dilithium {
     ($name:ident, $module:ident, $display_name:expr) => {
         pub struct $name {
-            keypair: KeyPair<{ Self::SECRET_KEY_SIZE }, { Self::PUBLIC_KEY_SIZE }>,
+            secret_key: Key<{ Self::SECRET_KEY_SIZE }>,
+            public_key: Key<{ Self::PUBLIC_KEY_SIZE }>,
         }
 
         impl CryptoAlgorithm for $name {
@@ -17,49 +18,60 @@ macro_rules! impl_dilithium {
             const PUBLIC_KEY_SIZE: usize = $module::public_key_bytes();
             const SECRET_KEY_SIZE: usize = $module::secret_key_bytes();
 
-            type KeyPair = KeyPair<{ Self::SECRET_KEY_SIZE }, { Self::PUBLIC_KEY_SIZE }>;
+            type SecretKey = Key<{ Self::SECRET_KEY_SIZE }>;
+            type PublicKey = Key<{ Self::PUBLIC_KEY_SIZE }>;
 
             fn regenerate_keypair(&mut self) {
                 let (pk, sk) = $module::keypair();
-
-                self.keypair = KeyPair::new(sk.as_bytes(), pk.as_bytes()).expect("Failed to regenerate keypair");
+                self.secret_key = CryptoKey::from_bytes(sk.as_bytes())
+                    .expect("Failed to create secret key from bytes");
+                self.public_key = CryptoKey::from_bytes(pk.as_bytes())
+                    .expect("Failed to create public key from bytes");
             }
 
-            fn set_keypair(&mut self, keypair: Self::KeyPair) {
-                self.keypair = keypair;
+            fn set_secret(&mut self, key: Self::SecretKey) {
+                self.secret_key = key;
             }
 
-            fn get_keypair(&self) -> &Self::KeyPair {
-                &self.keypair
+            fn set_public(&mut self, key: Self::PublicKey) {
+                self.public_key = key;
+            }
+
+            fn get_secret(&self) -> &Self::SecretKey {
+                &self.secret_key
+            }
+
+            fn get_public(&self) -> &Self::PublicKey {
+                &self.public_key
             }
         }
 
         impl Signature for $name {
             const SIGNATURE_SIZE: usize = $module::signature_bytes();
 
-            type PublicKey = PublicKey<{ Self::PUBLIC_KEY_SIZE }>;
-
             fn sign(&self, message: &[u8]) -> CryptoResult<Vec<u8>> {
-                let secret_key = &self.keypair.secret;
-
-                let sk = $module::SecretKey::from_bytes(secret_key.as_bytes())
-                    .map_err(|e| CryptoError::new(format!("Invalid secret key: {:?}", e)))?;
+                let sk = $module::SecretKey::from_bytes(self.secret_key.as_bytes())
+                    .map_err(|e| CryptoError::InvalidInput(
+                        "secret key",
+                        format!("{:?}", e)
+                    ))?;
 
                 let signed_msg = $module::sign(message, &sk);
-
                 Ok(signed_msg.as_bytes().to_vec())
             }
 
-            fn verify(
-                public_key: &Self::PublicKey,
-                message: &[u8],
-                signature: &[u8],
-            ) -> CryptoResult<bool> {
+            fn verify(public_key: &Self::PublicKey, message: &[u8], signature: &[u8]) -> CryptoResult<bool> {
                 let pk = $module::PublicKey::from_bytes(public_key.as_bytes())
-                    .map_err(|e| CryptoError::new(format!("Invalid public key: {:?}", e)))?;
+                    .map_err(|e| CryptoError::InvalidInput(
+                        "public key",
+                        format!("{:?}", e)
+                    ))?;
 
                 let signed_msg = $module::SignedMessage::from_bytes(signature)
-                    .map_err(|e| CryptoError::new(format!("Invalid signature: {:?}", e)))?;
+                    .map_err(|e| CryptoError::InvalidInput(
+                        "signature",
+                        format!("{:?}", e)
+                    ))?;
 
                 match $module::open(&signed_msg, &pk) {
                     Ok(opened_msg) => Ok(opened_msg == message),
@@ -77,41 +89,49 @@ macro_rules! impl_dilithium {
         impl $name {
             pub fn new() -> Self {
                 let (pk, sk) = $module::keypair();
-
                 Self {
-                    keypair: KeyPair::new(sk.as_bytes(), pk.as_bytes()).expect("Failed to create keypair"),
+                    secret_key: CryptoKey::from_bytes(sk.as_bytes())
+                        .expect("Failed to create secret key from bytes"),
+                    public_key: CryptoKey::from_bytes(pk.as_bytes())
+                        .expect("Failed to create public key from bytes"),
                 }
             }
 
             pub fn sign_detached(&self, message: &[u8]) -> CryptoResult<Vec<u8>> {
-                let secret_key = &self.keypair.secret;
-
-                let sk = $module::SecretKey::from_bytes(secret_key.as_bytes())
-                    .map_err(|e| CryptoError::new(format!("Invalid secret key: {:?}", e)))?;
+                let sk = $module::SecretKey::from_bytes(self.secret_key.as_bytes())
+                    .map_err(|e| CryptoError::InvalidInput(
+                        "secret key",
+                        format!("{:?}", e)
+                    ))?;
 
                 let sig = $module::detached_sign(message, &sk);
-
                 Ok(sig.as_bytes().to_vec())
             }
 
             pub fn verify_detached(
-                public_key: &PublicKey<{ Self::PUBLIC_KEY_SIZE }>,
+                public_key: &Key<{ Self::PUBLIC_KEY_SIZE }>,
                 message: &[u8],
                 signature: &[u8],
             ) -> CryptoResult<bool> {
                 if signature.len() != Self::SIGNATURE_SIZE {
-                    return Err(CryptoError::new(format!(
-                        "Invalid signature size: expected {}, got {}",
-                        Self::SIGNATURE_SIZE,
-                        signature.len()
-                    )));
+                    return Err(CryptoError::SizeMismatch {
+                        context: "signature",
+                        expected: Self::SIGNATURE_SIZE,
+                        actual: signature.len(),
+                    });
                 }
 
                 let pk = $module::PublicKey::from_bytes(public_key.as_bytes())
-                    .map_err(|e| CryptoError::new(format!("Invalid public key: {:?}", e)))?;
+                    .map_err(|e| CryptoError::InvalidInput(
+                        "public key",
+                        format!("{:?}", e)
+                    ))?;
 
                 let sig = $module::DetachedSignature::from_bytes(signature)
-                    .map_err(|e| CryptoError::new(format!("Invalid signature: {:?}", e)))?;
+                    .map_err(|e| CryptoError::InvalidInput(
+                        "signature",
+                        format!("{:?}", e)
+                    ))?;
 
                 match $module::verify_detached_signature(&sig, message, &pk) {
                     Ok(_) => Ok(true),
@@ -119,6 +139,7 @@ macro_rules! impl_dilithium {
                 }
             }
         }
+
     };
 }
 
@@ -140,7 +161,7 @@ mod tests {
 
                     let signature = dilithium.sign(message).expect("Signing failed");
 
-                    let public_key = &dilithium.get_keypair().public;
+                    let public_key = dilithium.get_public();
                     let original_msg = b"Hello, Dilithium!";
                     
                     let is_valid = $variant::verify(public_key, original_msg, &signature)
@@ -160,7 +181,7 @@ mod tests {
 
                     assert_eq!(signature.len(), $variant::SIGNATURE_SIZE);
 
-                    let public_key = &dilithium.get_keypair().public;
+                    let public_key = dilithium.get_public();
                     let is_valid = $variant::verify_detached(public_key, message, &signature)
                         .expect("Detached verification failed");
 
@@ -175,7 +196,7 @@ mod tests {
 
                     let signature = dilithium.sign_detached(message).unwrap();
 
-                    let public_key = &dilithium.get_keypair().public;
+                    let public_key = dilithium.get_public();
                     let is_valid = $variant::verify_detached(public_key, wrong_message, &signature)
                         .unwrap();
 
@@ -190,7 +211,7 @@ mod tests {
                     let mut signature = dilithium.sign_detached(message).unwrap();
                     signature[0] ^= 1;
 
-                    let public_key = &dilithium.get_keypair().public;
+                    let public_key = dilithium.get_public();
                     let is_valid = $variant::verify_detached(public_key, message, &signature)
                         .unwrap();
 
@@ -205,7 +226,7 @@ mod tests {
 
                     let signature = dilithium1.sign_detached(message).unwrap();
 
-                    let wrong_public_key = &dilithium2.get_keypair().public;
+                    let wrong_public_key = dilithium2.get_public();
                     let is_valid = $variant::verify_detached(wrong_public_key, message, &signature)
                         .unwrap();
 
@@ -219,7 +240,7 @@ mod tests {
 
                     let signature = dilithium.sign_detached(message).unwrap();
 
-                    let public_key = &dilithium.get_keypair().public;
+                    let public_key = dilithium.get_public();
                     let is_valid = $variant::verify_detached(public_key, message, &signature)
                         .unwrap();
 
@@ -233,7 +254,7 @@ mod tests {
 
                     let signature = dilithium.sign_detached(&message).unwrap();
 
-                    let public_key = &dilithium.get_keypair().public;
+                    let public_key = dilithium.get_public();
                     let is_valid = $variant::verify_detached(public_key, &message, &signature)
                         .unwrap();
 
@@ -241,18 +262,20 @@ mod tests {
                 }
 
                 #[test]
-                fn [<test_ $variant:lower _keypair_transfer>]() {
+                fn [<test_ $variant:lower _key_transfer>]() {
                     let dilithium1 = $variant::new();
-                    let keypair = dilithium1.get_keypair();
+                    let secret_key = dilithium1.get_secret().clone();
+                    let public_key = dilithium1.get_public().clone();
 
                     let mut dilithium2 = $variant::new();
-                    dilithium2.set_keypair(keypair.clone());
+                    dilithium2.set_secret(secret_key);
+                    dilithium2.set_public(public_key);
 
                     let message = b"Test message";
                     let signature = dilithium1.sign_detached(message).unwrap();
 
-                    let public_key = &dilithium2.get_keypair().public;
-                    let is_valid = $variant::verify_detached(public_key, message, &signature)
+                    let public_key2 = dilithium2.get_public();
+                    let is_valid = $variant::verify_detached(public_key2, message, &signature)
                         .unwrap();
 
                     assert!(is_valid);
@@ -261,10 +284,10 @@ mod tests {
                 #[test]
                 fn [<test_ $variant:lower _regenerate_keypair>]() {
                     let mut dilithium = $variant::new();
-                    let old_public_key = dilithium.get_keypair().public.clone();
+                    let old_public_key = dilithium.get_public().clone();
 
                     dilithium.regenerate_keypair();
-                    let new_public_key = dilithium.get_keypair().public.clone();
+                    let new_public_key = dilithium.get_public().clone();
 
                     assert!(!old_public_key.eq(&new_public_key));
                 }
@@ -279,7 +302,7 @@ mod tests {
 
                     assert_eq!(sig1.len(), sig2.len());
 
-                    let public_key = &dilithium.get_keypair().public;
+                    let public_key = dilithium.get_public();
                     let is_valid1 = $variant::verify_detached(public_key, message, &sig1).unwrap();
                     let is_valid2 = $variant::verify_detached(public_key, message, &sig2).unwrap();
 
@@ -293,7 +316,7 @@ mod tests {
                     let message = b"Test";
                     let invalid_sig = vec![0u8; 100];
 
-                    let public_key = &dilithium.get_keypair().public;
+                    let public_key = dilithium.get_public();
                     let crypto_result = $variant::verify_detached(public_key, message, &invalid_sig);
 
                     assert!(crypto_result.is_err());

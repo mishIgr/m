@@ -1,5 +1,5 @@
-use crate::crypto::utils::{CryptoResult, CryptoError, SecretKey};
-use crate::crypto::traits::{CryptoAlgorithm, SymmetricCipher, SymmetricEncryption};
+use crate::crypto::{CryptoResult, CryptoError, CryptoKey, SymmetricCipher, CryptoAlgorithm, SymmetricEncryption};
+use crate::crypto::key::Key;
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes128Gcm as Aes128GcmImpl, Aes256Gcm as Aes256GcmImpl,
@@ -10,7 +10,7 @@ use rand::RngCore;
 macro_rules! impl_aes_gcm {
     ($name:ident, $impl_type:ty, $key_size:expr, $display_name:expr) => {
         pub struct $name {
-            key: SecretKey<$key_size>,
+            key: Key<$key_size>,
         }
 
         impl CryptoAlgorithm for $name {
@@ -19,11 +19,15 @@ macro_rules! impl_aes_gcm {
 
         impl SymmetricCipher for $name {
             const KEY_SIZE: usize = $key_size;
-            type SecretKey = SecretKey<$key_size>;
+            type SecretKey = Key<$key_size>;
 
             fn regenerate_key(&mut self) {
-                rand::rng().fill_bytes(self.key.as_mut_bytes());
+                let mut rng = rand::rng();
+                let mut buf = [0u8; Self::KEY_SIZE];
+                rng.fill_bytes(&mut buf);
+                self.key = CryptoKey::from_bytes(&buf).expect("Failed to generate key");
             }
+
 
             fn set_key(&mut self, key: Self::SecretKey) {
                 self.key = key;
@@ -45,15 +49,18 @@ macro_rules! impl_aes_gcm {
                 associated_data: &[u8],
             ) -> CryptoResult<Vec<u8>> {
                 if nonce.len() != Self::NONCE_SIZE {
-                    return Err(CryptoError::new(format!(
-                        "Invalid nonce size: expected {}, got {}",
-                        Self::NONCE_SIZE,
-                        nonce.len()
-                    )));
+                    return Err(CryptoError::SizeMismatch {
+                        context: "nonce",
+                        expected: Self::NONCE_SIZE,
+                        actual: nonce.len(),
+                    });
                 }
 
                 let cipher = <$impl_type>::new_from_slice(self.key.as_bytes())
-                    .map_err(|e| CryptoError::new(format!("Failed to create cipher: {:?}", e)))?;
+                    .map_err(|e| CryptoError::OperationFailed(
+                        "Cipher initialization",
+                        format!("failed to create cipher: {:?}", e)
+                    ))?;
 
                 let nonce_array = Nonce::from_slice(nonce);
 
@@ -64,7 +71,10 @@ macro_rules! impl_aes_gcm {
 
                 cipher
                     .encrypt(nonce_array, payload)
-                    .map_err(|e| CryptoError::new(format!("Encryption failed: {:?}", e)))
+                    .map_err(|e| CryptoError::OperationFailed(
+                        "Encryption",
+                        format!("{:?}", e)
+                    ))
             }
 
             fn decrypt(
@@ -74,22 +84,26 @@ macro_rules! impl_aes_gcm {
                 associated_data: &[u8],
             ) -> CryptoResult<Vec<u8>> {
                 if nonce.len() != Self::NONCE_SIZE {
-                    return Err(CryptoError::new(format!(
-                        "Invalid nonce size: expected {}, got {}",
-                        Self::NONCE_SIZE,
-                        nonce.len()
-                    )));
+                    return Err(CryptoError::SizeMismatch {
+                        context: "nonce",
+                        expected: Self::NONCE_SIZE,
+                        actual: nonce.len(),
+                    });
                 }
 
                 if ciphertext.len() < Self::TAG_SIZE {
-                    return Err(CryptoError::new(format!(
-                        "Ciphertext too short: must be at least {} bytes",
-                        Self::TAG_SIZE
-                    )));
+                    return Err(CryptoError::SizeMismatch {
+                        context: "ciphertext",
+                        expected: Self::TAG_SIZE,
+                        actual: ciphertext.len(),
+                    });
                 }
 
                 let cipher = <$impl_type>::new_from_slice(self.key.as_bytes())
-                    .map_err(|e| CryptoError::new(format!("Failed to create cipher: {:?}", e)))?;
+                    .map_err(|e| CryptoError::OperationFailed(
+                        "Cipher initialization",
+                        format!("failed to create cipher: {:?}", e)
+                    ))?;
 
                 let nonce_array = Nonce::from_slice(nonce);
 
@@ -100,7 +114,10 @@ macro_rules! impl_aes_gcm {
 
                 cipher
                     .decrypt(nonce_array, payload)
-                    .map_err(|e| CryptoError::new(format!("Decryption failed: {:?}", e)))
+                    .map_err(|e| CryptoError::OperationFailed(
+                        "Decryption",
+                        format!("{:?}", e)
+                    ))
             }
         }
 
@@ -112,18 +129,20 @@ macro_rules! impl_aes_gcm {
 
         impl $name {
             pub fn new() -> Self {
-                let mut key = [0u8; $key_size];
-                rand::rng().fill_bytes(&mut key);
-                Self { key: key.into() }
+                let mut rng = rand::rng();
+                let mut buf = [0u8; Self::KEY_SIZE];
+                rng.fill_bytes(&mut buf);
+                Self{ key: CryptoKey::from_bytes(&buf).expect("Failed to generate key") }
             }
 
-            pub fn from_key(key: [u8; $key_size]) -> Self {
-                Self { key: key.into() }
+            pub fn from_key(key: Key<$key_size>) -> Self {
+                Self { key }
             }
 
             pub fn generate_nonce() -> [u8; Self::NONCE_SIZE] {
                 let mut nonce = [0u8; Self::NONCE_SIZE];
-                rand::rng().fill_bytes(&mut nonce);
+                let mut rng = rand::rng();
+                rng.fill_bytes(&mut nonce);
                 nonce
             }
         }
@@ -273,10 +292,11 @@ mod tests {
 
                 #[test]
                 fn [<test_ $variant:lower _from_key>]() {
-                    let key = [0x42u8; $variant::KEY_SIZE];
+                    let key_bytes = [0x42u8; $variant::KEY_SIZE];
+                    let key = CryptoKey::from_bytes(&key_bytes).unwrap();
                     let cipher = $variant::from_key(key);
 
-                    assert_eq!(*cipher.get_key().as_bytes(), key);
+                    assert_eq!(cipher.get_key().as_bytes(), &key_bytes);
 
                     let nonce = $variant::generate_nonce();
                     let plaintext = b"test";
