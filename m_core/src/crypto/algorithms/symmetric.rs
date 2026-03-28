@@ -5,7 +5,7 @@ use aes_gcm::{
     Aes128Gcm as Aes128GcmImpl, Aes256Gcm as Aes256GcmImpl,
     Nonce,
 };
-use rand::RngCore;
+use rand::Rng;
 
 macro_rules! impl_aes_gcm {
     ($name:ident, $impl_type:ty, $key_size:expr, $display_name:expr) => {
