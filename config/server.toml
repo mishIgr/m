@@ -1,0 +1,12 @@
+[host]
+bind_address = "0.0.0.0:50051"
+
+[database]
+path = "~/.local/share/m/db.redb"
+
+[logging]
+path = "~/.local/share/m/logs/"
+
+[encryption]
+user_key = "1a2b3c4d5e6f1234567890abcdef1234"
+admin_key = "1a2b3c4d5e6f1234567890abcdef1235"

@@ -9,6 +9,7 @@ use rand::Rng;
 
 macro_rules! impl_aes_gcm {
     ($name:ident, $impl_type:ty, $key_size:expr, $display_name:expr) => {
+        #[derive(Clone)]
         pub struct $name {
             key: Key<$key_size>,
         }
@@ -41,6 +42,12 @@ macro_rules! impl_aes_gcm {
         impl SymmetricEncryption for $name {
             const NONCE_SIZE: usize = 12;
             const TAG_SIZE: usize = 16;
+
+            fn generate_nonce() -> Vec<u8> {
+                let mut nonce = vec![0u8; Self::NONCE_SIZE];
+                rand::rng().fill_bytes(&mut nonce);
+                nonce
+            }
 
             fn encrypt(
                 &self,
@@ -137,13 +144,6 @@ macro_rules! impl_aes_gcm {
 
             pub fn from_key(key: Key<$key_size>) -> Self {
                 Self { key }
-            }
-
-            pub fn generate_nonce() -> [u8; Self::NONCE_SIZE] {
-                let mut nonce = [0u8; Self::NONCE_SIZE];
-                let mut rng = rand::rng();
-                rng.fill_bytes(&mut nonce);
-                nonce
             }
         }
     };

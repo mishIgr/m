@@ -11,6 +11,9 @@ pub trait CryptoKey {
     fn from_bytes(bytes: &[u8]) -> CryptoResult<Self>
     where
         Self: Sized + Clone;
+    fn from_vec(bytes: Vec<u8>) -> CryptoResult<Self>
+    where
+        Self: Sized + Clone;
 }
 
 pub trait CryptoAlgorithm {
@@ -30,7 +33,7 @@ pub trait Mac: CryptoAlgorithm {
 
     fn regenerate_key(&mut self);
     fn set_key(&mut self, key: Self::SecretKey);
-    fn get_key(&self) -> Self::SecretKey;
+    fn get_key(&self) -> &Self::SecretKey;
 
     fn compute(&self, data: &[u8]) -> CryptoResult<Vec<u8>>;
     fn verify(&self, data: &[u8], tag: &[u8]) -> CryptoResult<bool>;
@@ -49,6 +52,8 @@ pub trait SymmetricCipher: CryptoAlgorithm {
 pub trait SymmetricEncryption: SymmetricCipher {
     const NONCE_SIZE: usize;
     const TAG_SIZE: usize;
+
+    fn generate_nonce() -> Vec<u8>;
 
     fn encrypt(
         &self,

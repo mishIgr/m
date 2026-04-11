@@ -2,68 +2,16 @@ use flexi_logger::{
     Cleanup, Criterion, DeferredNow, FileSpec, Logger as FlexiLogger,
     LoggerHandle, Naming, Record, WriteMode,
 };
-use log::{Level};
+use log::Level;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::io::{self, Write};
 use std::sync::Mutex;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LogLevel {
-    Info,
-    Crit,
-    Secure,
-}
-
-impl LogLevel {
-    fn from_log_level(level: Level) -> Self {
-        match level {
-            Level::Info => LogLevel::Info,
-            Level::Error => LogLevel::Crit,
-            Level::Trace => LogLevel::Secure,
-            _ => LogLevel::Info,
-        }
-    }
-
-    fn to_log_level(&self) -> Level {
-        match self {
-            LogLevel::Info => Level::Info,
-            LogLevel::Crit => Level::Error,
-            LogLevel::Secure => Level::Trace,
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            LogLevel::Info => "INFO",
-            LogLevel::Crit => "CRIT",
-            LogLevel::Secure => "SECURE",
-        }
-    }
-
-    fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "info" => Some(LogLevel::Info),
-            "crit" | "critical" => Some(LogLevel::Crit),
-            "secure" => Some(LogLevel::Secure),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for LogLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// Конфигурация логгера
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggerConfig {
     pub log_dir: String,
     pub max_files: usize,
     pub max_file_size: u64,
-    pub min_level: String,
     #[serde(default = "default_basename")]
     pub basename: String,
 }
@@ -74,25 +22,49 @@ fn default_basename() -> String {
 
 impl Default for LoggerConfig {
     fn default() -> Self {
-        #[cfg(target_os = "linux")]
-        let log_dir = "/var/log/myapp".to_string();
-
-        #[cfg(target_os = "android")]
-        let log_dir = "/data/data/com.example.myapp/logs".to_string();
-
         Self {
-            log_dir,
+            log_dir: "/var/log/myapp".to_string(),
             max_files: 5,
             max_file_size: 10 * 1024 * 1024,
-            min_level: "info".to_string(),
-            basename: "app".to_string(),
+            basename: default_basename(),
         }
     }
 }
 
 impl LoggerConfig {
-    pub fn get_log_level(&self) -> LogLevel {
-        LogLevel::from_str(&self.min_level).unwrap_or(LogLevel::Info)
+    pub fn min_level() -> Level {
+        if cfg!(debug_assertions) {
+            Level::Debug
+        } else {
+            Level::Info
+        }
+    }
+
+    pub fn with_log_dir(log_dir: impl Into<String>) -> Self {
+        Self {
+            log_dir: log_dir.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn set_log_dir(mut self, log_dir: impl Into<String>) -> Self {
+        self.log_dir = log_dir.into();
+        self
+    }
+
+    pub fn set_basename(mut self, basename: impl Into<String>) -> Self {
+        self.basename = basename.into();
+        self
+    }
+
+    pub fn set_max_files(mut self, max_files: usize) -> Self {
+        self.max_files = max_files;
+        self
+    }
+
+    pub fn set_max_file_size(mut self, max_file_size: u64) -> Self {
+        self.max_file_size = max_file_size;
+        self
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -102,35 +74,37 @@ impl LoggerConfig {
         if self.max_file_size == 0 {
             return Err("max_file_size must be > 0".to_string());
         }
-        if LogLevel::from_str(&self.min_level).is_none() {
-            return Err(format!("invalid min_level: {}", self.min_level));
-        }
         Ok(())
     }
+
+    pub fn from_toml_file(path: &str) -> io::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        toml::from_str(&content)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
 }
+
 
 fn custom_format(
     w: &mut dyn Write,
     now: &mut DeferredNow,
     record: &Record,
 ) -> Result<(), std::io::Error> {
-    let level_str = LogLevel::from_log_level(record.level()).as_str();
-
-    let message = record.args().to_string();
+    let level_str = record.level();
 
     write!(
         w,
         "[{}] [{}] {}",
         now.format("%Y-%m-%d %H:%M:%S"),
         level_str,
-        message
+        record.args()
     )
 }
 
 pub struct Logger {
     config: LoggerConfig,
     _handle: LoggerHandle,
-    min_level: LogLevel,
+    min_level: Level,
 }
 
 impl Logger {
@@ -139,11 +113,9 @@ impl Logger {
             .validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        let min_level = config.get_log_level();
+        let min_level = LoggerConfig::min_level();
 
-        let level_filter = LogLevel::to_log_level(&min_level);
-
-        let logger_builder = FlexiLogger::try_with_env_or_str(level_filter.as_str())
+        let handle = FlexiLogger::try_with_env_or_str(min_level.as_str())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
             .format(custom_format)
             .log_to_file(
@@ -157,9 +129,7 @@ impl Logger {
                 Naming::Numbers,
                 Cleanup::KeepLogFiles(config.max_files),
             )
-            .write_mode(WriteMode::BufferAndFlush);
-
-        let handle = logger_builder
+            .write_mode(WriteMode::BufferAndFlush)
             .start()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
@@ -170,42 +140,43 @@ impl Logger {
         })
     }
 
-    pub fn from_file(path: &str) -> io::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: LoggerConfig = toml::from_str(&content)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Self::new(config)
-    }
-
     pub fn with_defaults() -> io::Result<Self> {
         Self::new(LoggerConfig::default())
     }
 
-    fn should_log(&self, level: LogLevel) -> bool {
+    pub fn from_toml_file(path: &str) -> io::Result<Self> {
+        Self::new(LoggerConfig::from_toml_file(path)?)
+    }
+
+    fn should_log(&self, level: Level) -> bool {
         level >= self.min_level
     }
 
+    /// Только в debug-сборке. В release вызов компилируется в ничто.
+    pub fn debug(&self, message: &str) {
+        #[cfg(debug_assertions)]
+        if self.should_log(Level::Debug) {
+            log::debug!("{}", message);
+        }
+    }
+
     pub fn info(&self, message: &str) {
-        if self.should_log(LogLevel::Info) {
+        if self.should_log(Level::Info) {
             log::info!("{}", message);
         }
     }
 
-    pub fn crit(&self, message: &str) {
-        if self.should_log(LogLevel::Crit) {
-            log::error!("{}", message);
-        }
-    }
-
-    #[cfg(feature = "insecure_log")]
-    pub fn secure(&self, message: &str) {
-        if self.should_log(LogLevel::Secure) {
+    pub fn warn(&self, message: &str) {
+        if self.should_log(Level::Warn) {
             log::warn!("{}", message);
         }
     }
 
-    #[cfg(not(feature = "insecure_log"))]
-    pub fn secure(&self, _message: &str) {}
+    pub fn error(&self, message: &str) {
+        if self.should_log(Level::Error) {
+            log::error!("{}", message);
+        }
+    }
 
     pub fn get_config(&self) -> &LoggerConfig {
         &self.config
@@ -213,12 +184,12 @@ impl Logger {
 
     pub fn info_string(&self) -> String {
         format!(
-            "Logger: dir={}, max_files={}, max_size={} bytes, min_level={}, insecure_log={}",
+            "Logger: dir={}, max_files={}, max_size={} bytes, min_level={}, build={}",
             self.config.log_dir,
             self.config.max_files,
             self.config.max_file_size,
             self.min_level,
-            cfg!(feature = "insecure_log")
+            if cfg!(debug_assertions) { "debug" } else { "release" }
         )
     }
 }
@@ -233,11 +204,60 @@ pub fn init_logger(config: LoggerConfig) -> io::Result<()> {
 }
 
 pub fn reconfigure_logger(config: LoggerConfig) -> io::Result<()> {
+    // сначала создаём новый логгер — только потом берём мьютекс
+    let logger = Logger::new(config)?;
     let mut global = M_LOGGER.lock().unwrap();
-    
-    if let Some(logger) = global.take() {
-        drop(logger);
+    *global = Some(logger);
+    Ok(())
+}
+
+pub fn with_logger<F>(f: F)
+where
+    F: FnOnce(&Logger),
+{
+    match M_LOGGER.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(logger) => f(logger),
+            None => eprintln!("[m_logger] WARNING: logger is not initialized"),
+        },
+        Err(e) => eprintln!("[m_logger] ERROR: mutex poisoned: {}", e),
     }
-    
-    init_logger(config)
+}
+
+#[macro_export]
+macro_rules! log_debug {
+    ($($arg:tt)*) => {
+        // макрос тоже раскрывается в ничто в release
+        #[cfg(debug_assertions)]
+        $crate::logger::with_logger(|logger| {
+            logger.debug(&format!($($arg)*));
+        });
+    };
+}
+
+#[macro_export]
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        $crate::logger::with_logger(|logger| {
+            logger.info(&format!($($arg)*));
+        });
+    };
+}
+
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        $crate::logger::with_logger(|logger| {
+            logger.warn(&format!($($arg)*));
+        });
+    };
+}
+
+#[macro_export]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        $crate::logger::with_logger(|logger| {
+            logger.error(&format!($($arg)*));
+        });
+    };
 }

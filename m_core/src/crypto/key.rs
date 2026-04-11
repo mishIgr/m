@@ -28,6 +28,19 @@ impl<const N: usize> CryptoKey for Key<N> {
             data: bytes.to_vec()
         })
     }
+
+    fn from_vec(bytes: Vec<u8>) -> CryptoResult<Self> {
+        if bytes.len() != N {
+            return Err(CryptoError::SizeMismatch {
+                context: "key",
+                expected: N,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Key {
+            data: bytes
+        })
+    }
 }
 
 impl<const N: usize> PartialEq for Key<N> {

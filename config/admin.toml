@@ -1,0 +1,10 @@
+[connection]
+server_address = "http://127.0.0.1:50051"
+
+[auth]
+role = "admin"
+shared_key = "f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9d0c1b2a3f4e5d6c7b8a9f0e1"
+
+[chats]
+[chats.keys]
+general = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
