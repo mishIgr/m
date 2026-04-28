@@ -1,6 +1,6 @@
 use std::path::Path;
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use m_core::LoggerConfig;
 
 fn expand(s: &str) -> String {
@@ -30,71 +30,62 @@ impl ClientConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ServerImport {
-    pub connection: ServerConnection,
-    pub auth: ServerAuth,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ServerConnection {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerCard {
     pub id: String,
-    pub server_address: String,
+    pub address: String,
+    pub shared_key: Vec<u8>,
+    pub admin_key: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ServerAuth {
-    pub shared_key: String,
-    pub admin_key: Option<String>,
-}
+impl ServerCard {
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(bincode::serialize(self)?)
+    }
 
-impl ServerImport {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(bincode::deserialize(bytes)?)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read server file: {}", path.display()))?;
-        let cfg: Self = toml::from_str(&content)
-            .with_context(|| "Failed to parse server import TOML")?;
-        cfg.validate()?;
-        Ok(cfg)
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read server card: {}", path.display()))?;
+        Self::from_bytes(&bytes)
     }
 
-    fn validate(&self) -> Result<()> {
-        validate_hex(&self.auth.shared_key, "shared_key")?;
-        if let Some(ref ak) = self.auth.admin_key {
-            validate_hex(ak, "admin_key")?;
-        }
-        Ok(())
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let bytes = self.to_bytes()?;
+        std::fs::write(path, bytes)
+            .with_context(|| format!("Failed to write server card: {}", path.display()))
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ChatImport {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCard {
     pub server_id: String,
     pub chat_id: String,
     pub name: String,
-    pub encryption_key: String,
+    pub encryption_key: Vec<u8>,
 }
 
-impl ChatImport {
+impl ChatCard {
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(bincode::serialize(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(bincode::deserialize(bytes)?)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read chat file: {}", path.display()))?;
-        let cfg: Self = toml::from_str(&content)
-            .with_context(|| "Failed to parse chat import TOML")?;
-        validate_hex(&cfg.encryption_key, "encryption_key")?;
-        Ok(cfg)
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read chat card: {}", path.display()))?;
+        Self::from_bytes(&bytes)
     }
-}
 
-fn validate_hex(key: &str, name: &str) -> Result<()> {
-    if key.is_empty() {
-        anyhow::bail!("{} cannot be empty", name);
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let bytes = self.to_bytes()?;
+        std::fs::write(path, bytes)
+            .with_context(|| format!("Failed to write chat card: {}", path.display()))
     }
-    if key.len() % 2 != 0 {
-        anyhow::bail!("{} must have even length", name);
-    }
-    if !key.chars().all(|c| c.is_ascii_hexdigit()) {
-        anyhow::bail!("{} contains invalid hex characters", name);
-    }
-    Ok(())
 }

@@ -19,7 +19,7 @@ pub struct LiveMessage {
 
 pub enum LiveEvent {
     Message(LiveMessage),
-    SyncComplete { server_id: String, chat_name: String },
+    SyncComplete { _server_id: String, _chat_name: String },
     Error { server_id: String, message: String },
     ServerUnavailable(String),
     Disconnected(String),
@@ -157,8 +157,8 @@ pub async fn subscribe(
                             .cloned()
                             .unwrap_or_else(|| sync.chat_id.clone());
                         let _ = event_tx.send(LiveEvent::SyncComplete {
-                            server_id: sid.clone(),
-                            chat_name,
+                            _server_id: sid.clone(),
+                            _chat_name: chat_name,
                         });
                     }
                     Some(server_event::Event::Error(err)) => {

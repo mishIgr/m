@@ -87,6 +87,7 @@ impl ConnectionManager {
         self.start_server(server_id)
     }
 
+    #[allow(dead_code)]
     pub fn is_running(&self, server_id: &str) -> bool {
         self.cancels.contains_key(server_id)
     }

@@ -48,6 +48,7 @@ impl Identity {
         self.tor_sk.clone().into()
     }
 
+    #[allow(dead_code)]
     pub fn to_contact_card(&self) -> ContactCard {
         ContactCard {
             signing_pk: self.signing.get_public().as_bytes().to_vec(),

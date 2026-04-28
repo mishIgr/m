@@ -3,782 +3,1056 @@ use std::io;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, EnableBracketedPaste, DisableBracketedPaste};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers,
+};
 use crossterm::execute;
+use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::identity::ContactCard;
-use crate::sharing::{ShareData, ServerShareData, ChatShareData};
-use crate::config::ClientConfig;
+use crate::config::{ServerCard, ChatCard};
 use crate::connection_manager::ConnectionManager;
+use crate::identity::ContactCard;
 use crate::live::LiveEvent;
-use crate::store::{NodeState, Store};
+use crate::sharing::{ShareData, ChatShareData};
+use crate::store::{ContactRecord, ChatRecord, NodeState, ServerRecord, Store};
 use crate::transport::Transport;
 
-const MAX_LINES: usize = 2000;
+const MAX_MESSAGES: usize = 2000;
+const MAX_RECEIVING_LINES: usize = 500;
+
+// ── Screen state ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+enum Screen {
+    Contacts,
+    Servers,
+    Chats { server_id: String },
+    Share,
+}
+
+// ── Overlay ───────────────────────────────────────────────────────────────────
+
+enum Overlay {
+    None,
+    Info(Vec<String>),
+    Error(String),
+    ShareData(ShareStep),
+}
+
+enum ShareStep {
+    SelectContact { contacts: Vec<ContactRecord>, cursor: usize },
+    SelectServer  { contact: ContactRecord, servers: Vec<ServerRecord>, cursor: usize },
+    SelectChat    { contact: ContactRecord, server: ServerRecord, chats: Vec<ChatRecord>, cursor: usize },
+}
+
+// ── Live chat mode ────────────────────────────────────────────────────────────
+
+enum LiveMode {
+    Off,
+    On {
+        server_id: String,
+        chat_id: String,
+        messages: VecDeque<String>,
+        scroll: u16,
+    },
+}
+
+// ── Tor ───────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq)]
+enum TorStatus {
+    Off,
+    Starting(u8),
+    Running,
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
 
 struct App {
-    left_lines: VecDeque<String>,
-    right_lines: VecDeque<String>,
+    screen: Screen,
+    overlay: Overlay,
+    live_mode: LiveMode,
+    tor_status: TorStatus,
+    receiving_locked: bool,
+    receiving_lines: VecDeque<String>,
+
+    contacts: Vec<ContactRecord>,
+    servers: Vec<ServerRecord>,
+    servers_last_ts: Vec<Option<i64>>, // max last_synced_ts across all chats per server
+    chats: Vec<ChatRecord>,
+
+    contacts_cursor: usize,
+    servers_cursor: usize,
+    chats_cursor: usize,
+
     input: String,
     cursor_pos: usize,
-    live_on: bool,
-    left_scroll: u16,
-    right_scroll: u16,
 }
 
 impl App {
     fn new() -> Self {
         Self {
-            left_lines: VecDeque::new(),
-            right_lines: VecDeque::new(),
+            screen: Screen::Contacts,
+            overlay: Overlay::None,
+            live_mode: LiveMode::Off,
+            tor_status: TorStatus::Off,
+            receiving_locked: false,
+            receiving_lines: VecDeque::new(),
+            contacts: vec![],
+            servers: vec![],
+            servers_last_ts: vec![],
+            chats: vec![],
+            contacts_cursor: 0,
+            servers_cursor: 0,
+            chats_cursor: 0,
             input: String::new(),
             cursor_pos: 0,
-            live_on: false,
-            left_scroll: 0,
-            right_scroll: 0,
         }
     }
 
-    fn push_left(&mut self, line: String) {
-        self.left_lines.push_back(line);
-        if self.left_lines.len() > MAX_LINES {
-            self.left_lines.pop_front();
+    fn input_prompt(&self) -> &'static str {
+        match &self.screen {
+            Screen::Contacts => "contacts",
+            Screen::Servers => "servers",
+            Screen::Chats { .. } => "servers/chats",
+            Screen::Share => "share",
         }
-        self.left_scroll = self.left_lines.len().saturating_sub(1) as u16;
     }
 
-    fn push_right(&mut self, line: String) {
-        self.right_lines.push_back(line);
-        if self.right_lines.len() > MAX_LINES {
-            self.right_lines.pop_front();
-        }
-        self.right_scroll = self.right_lines.len().saturating_sub(1) as u16;
+    fn is_input_locked(&self) -> bool {
+        self.receiving_locked || matches!(self.tor_status, TorStatus::Starting(_))
+    }
+
+    fn set_error(&mut self, msg: impl Into<String>) {
+        self.overlay = Overlay::Error(msg.into());
+    }
+
+    fn set_info(&mut self, lines: Vec<String>) {
+        self.overlay = Overlay::Info(lines);
+    }
+}
+
+// ── Refresh helpers ───────────────────────────────────────────────────────────
+
+fn refresh_contacts(app: &mut App, store: &Store) {
+    app.contacts = store.list_contacts().unwrap_or_default();
+    app.contacts_cursor = app.contacts_cursor.min(app.contacts.len().saturating_sub(1));
+}
+
+fn refresh_servers(app: &mut App, store: &Store) {
+    app.servers = store.list_servers().unwrap_or_default();
+    app.servers_cursor = app.servers_cursor.min(app.servers.len().saturating_sub(1));
+    app.servers_last_ts = app.servers.iter().map(|s| {
+        store.list_chats_for_server(&s.id).ok()
+            .and_then(|chats| {
+                chats.iter()
+                    .filter(|c| c.state == NodeState::Enabled && c.last_synced_ts > 0)
+                    .map(|c| c.last_synced_ts)
+                    .max()
+            })
+    }).collect();
+}
+
+fn refresh_chats(app: &mut App, store: &Store) {
+    if let Screen::Chats { server_id } = &app.screen.clone() {
+        app.chats = store.list_chats_for_server(server_id).unwrap_or_default();
+        app.chats_cursor = app.chats_cursor.min(app.chats.len().saturating_sub(1));
     }
 }
 
-enum CmdResult {
-    Output,
-    Quit,
-    Clear,
-}
-
-fn parse_command(input: &str) -> CmdResult {
-    let input = input.trim();
-    if input.is_empty() {
-        return CmdResult::Output;
-    }
-
-    let parts: Vec<&str> = input.splitn(2, ' ').collect();
-    let cmd = parts[0].to_lowercase();
-
-    match cmd.as_str() {
-        "quit" | "exit" | "q" => CmdResult::Quit,
-        "clear" | "cls" => CmdResult::Clear,
-        _ => CmdResult::Output,
-    }
-}
+// ── Command execution ─────────────────────────────────────────────────────────
 
 async fn execute_command(
     input: &str,
+    app: &mut App,
     store: &Store,
     manager: &mut ConnectionManager,
     event_tx: &mpsc::UnboundedSender<LiveEvent>,
     share_state: &mut Option<(CancellationToken, Option<tokio::process::Child>)>,
-) -> Vec<String> {
-    let input = input.trim();
-    let words: Vec<&str> = input.split_whitespace().collect();
-    if words.is_empty() {
-        return vec![];
+) -> bool /* quit */ {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
     }
+
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
     let cmd = words[0].to_lowercase();
 
+    // ── Global navigation ────────────────────────────────────────────────────
     match cmd.as_str() {
-        "help" | "?" => vec![
-            "Commands:".into(),
-            "  whoami                                            Show own identity".into(),
-            "  export-contact <path>                             Export contact card to binary file".into(),
-            "  import-contact <path> [name]                      Import contact from binary file".into(),
-            "  list contacts                                     List contacts".into(),
-            "  rename-contact <id> <new_name>                    Rename a contact".into(),
-            "  remove-contact <id>                               Remove a contact".into(),
-            "  import-server <path>                              Import server config".into(),
-            "  import-chat <path>                                Import chat config".into(),
-            "  enable server <id>                                Enable server".into(),
-            "  disable server <id>                               Disable server".into(),
-            "  enable chat <server_id> <chat_id>                 Enable chat".into(),
-            "  disable chat <server_id> <chat_id>                Disable chat".into(),
-            "  list servers                                      List servers".into(),
-            "  list chats [server_id]                            List chats".into(),
-            "  send <server_id> <chat_id> <message>              Send a message".into(),
-            "  history <server_id> <chat_id> [--limit N]         Fetch history".into(),
-            "  share-listen [port]                               Start Tor share listener".into(),
-            "  share-stop                                        Stop share listener".into(),
-            "  share server <server_id> <contact_id>             Share server with contact".into(),
-            "  share chat <server_id> <chat_id> <contact_id>     Share chat with contact".into(),
-            "  admin <server_id> create-chat <id>                Create chat".into(),
-            "  admin <server_id> delete-chat <id>                Delete chat".into(),
-            "  admin <server_id> list-chats                      List chats on server".into(),
-            "  deploy-server <user> <ip> <pass> <server_id>       Deploy server via SSH (keys auto-generated)".into(),
-            "  remove-server <user> <ip> <pass> <server_id>      Remove server via SSH and disable locally".into(),
-            "  clear                                             Clear output panel".into(),
-            "  quit                                              Exit".into(),
-        ],
-        "whoami" => {
-            match store.load_identity() {
-                Ok(Some(identity)) => {
-                    vec![
-                        format!("  ID:         {}", identity.id),
-                        format!("  Onion:      {}", {
-                            let tor_pk_arr: [u8; 32] = identity.tor_pk_bytes.clone().try_into()
-                                .unwrap_or([0u8; 32]);
-                            match torut::onion::TorPublicKeyV3::from_bytes(&tor_pk_arr) {
-                                Ok(pk) => pk.get_onion_address().to_string(),
-                                Err(_) => "<invalid tor key>".into(),
-                            }
-                        }),
-                        format!("  Signing PK: {}", hex::encode(&identity.signing_pk_bytes)),
-                    ]
-                }
-                Ok(None) => vec!["No identity found. Restart the client to generate one.".into()],
-                Err(e) => vec![format!("Error: {e}")],
-            }
+        "quit" | "exit" | "q" => return true,
+        "contacts" => {
+            app.screen = Screen::Contacts;
+            refresh_contacts(app, store);
+            return false;
         }
-        "export-contact" => {
-            if words.len() < 2 {
-                return vec!["Usage: export-contact <path>".into()];
-            }
-            let path = shellexpand::tilde(words[1]);
-            match store.load_identity() {
-                Ok(Some(identity)) => {
-                    let tor_pk_arr: [u8; 32] = match identity.tor_pk_bytes.clone().try_into() {
-                        Ok(arr) => arr,
-                        Err(_) => return vec!["Error: invalid tor public key length".into()],
-                    };
-                    let onion_address = match torut::onion::TorPublicKeyV3::from_bytes(&tor_pk_arr) {
-                        Ok(pk) => pk.get_onion_address().to_string(),
-                        Err(_) => return vec!["Error: invalid tor public key".into()],
-                    };
-                    let card = ContactCard {
-                        signing_pk: identity.signing_pk_bytes.clone(),
-                        tor_pk: identity.tor_pk_bytes.clone(),
-                        onion_address,
-                    };
-                    match card.to_bytes() {
-                        Ok(bytes) => {
-                            match std::fs::write(path.as_ref(), &bytes) {
-                                Ok(()) => vec![format!("Contact card exported to {}", path)],
-                                Err(e) => vec![format!("Error writing file: {e}")],
-                            }
-                        }
-                        Err(e) => vec![format!("Error serializing: {e}")],
-                    }
-                }
-                Ok(None) => vec!["No identity found. Restart the client to generate one.".into()],
-                Err(e) => vec![format!("Error: {e}")],
-            }
-        }
-        "import-contact" => {
-            if words.len() < 2 {
-                return vec!["Usage: import-contact <path> [name]".into()];
-            }
-            let path = shellexpand::tilde(words[1]);
-            let name = if words.len() >= 3 {
-                Some(words[2..].join(" "))
-            } else {
-                None
-            };
-            match std::fs::read(path.as_ref()) {
-                Ok(bytes) => {
-                    match ContactCard::from_bytes(&bytes) {
-                        Ok(card) => {
-                            let id = card.id();
-                            match store.save_contact(&card, name.as_deref()) {
-                                Ok(()) => {
-                                    let display_name = name.as_deref().unwrap_or(&id);
-                                    vec![format!("Contact '{}' ({}) imported", display_name, id)]
-                                }
-                                Err(e) => vec![format!("Error saving contact: {e}")],
-                            }
-                        }
-                        Err(e) => vec![format!("Error reading contact file: {e}")],
-                    }
-                }
-                Err(e) => vec![format!("Error reading file: {e}")],
-            }
-        }
-        "rename-contact" => {
-            if words.len() < 3 {
-                return vec!["Usage: rename-contact <id> <new_name>".into()];
-            }
-            let id = words[1];
-            let new_name = words[2..].join(" ");
-            match store.rename_contact(id, &new_name) {
-                Ok(()) => vec![format!("Contact '{}' renamed to '{}'", id, new_name)],
-                Err(e) => vec![format!("Error: {e}")],
-            }
-        }
-        "remove-contact" => {
-            if words.len() < 2 {
-                return vec!["Usage: remove-contact <id>".into()];
-            }
-            let id = words[1];
-            match store.delete_contact(id) {
-                Ok(()) => vec![format!("Contact '{}' removed", id)],
-                Err(e) => vec![format!("Error: {e}")],
-            }
-        }
-        "import-server" => {
-            if words.len() < 2 {
-                return vec!["Usage: import-server <path>".into()];
-            }
-            let path = shellexpand::tilde(words[1]);
-            match crate::config::ServerImport::load(std::path::Path::new(path.as_ref())) {
-                Ok(server_toml) => {
-                    let id = server_toml.connection.id.clone();
-                    match store.save_server(&server_toml) {
-                        Ok(()) => vec![format!("Server '{}' imported: {}", id, server_toml.connection.server_address)],
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                Err(e) => vec![format!("Error: {e}")],
-            }
-        }
-        "import-chat" => {
-            if words.len() < 2 {
-                return vec!["Usage: import-chat <path>".into()];
-            }
-            let path = shellexpand::tilde(words[1]);
-            match crate::config::ChatImport::load(std::path::Path::new(path.as_ref())) {
-                Ok(chat_toml) => {
-                    match store.save_chat(&chat_toml) {
-                        Ok(()) => vec![format!(
-                            "Chat imported: {}/{} ({})",
-                            chat_toml.server_id, chat_toml.chat_id, chat_toml.name
-                        )],
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                Err(e) => vec![format!("Error: {e}")],
-            }
-        }
-        "enable" => {
-            if words.len() < 3 {
-                return vec!["Usage: enable server <id> | enable chat <server_id> <chat_id>".into()];
-            }
-            let target = words[1].to_lowercase();
-            match target.as_str() {
-                "server" => {
-                    let id = words[2];
-                    match store.set_server_state(id, NodeState::Enabled) {
-                        Ok(()) => {
-                            if let Err(e) = manager.start_server(id) {
-                                vec![
-                                    format!("Server '{id}' enabled."),
-                                    format!("Warning: could not start connection: {e}"),
-                                ]
-                            } else {
-                                vec![format!("Server '{id}' enabled and connected.")]
-                            }
-                        }
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                "chat" => {
-                    if words.len() < 4 {
-                        return vec!["Usage: enable chat <server_id> <chat_id>".into()];
-                    }
-                    let server_id = words[2];
-                    let chat_id = words[3];
-                    match store.set_chat_state(server_id, chat_id, NodeState::Enabled) {
-                        Ok(()) => {
-                            let _ = manager.restart_server(server_id);
-                            vec![format!("Chat '{server_id}/{chat_id}' enabled.")]
-                        }
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                _ => vec!["Usage: enable server <id> | enable chat <server_id> <chat_id>".into()],
-            }
-        }
-        "disable" => {
-            if words.len() < 3 {
-                return vec!["Usage: disable server <id> | disable chat <server_id> <chat_id>".into()];
-            }
-            let target = words[1].to_lowercase();
-            match target.as_str() {
-                "server" => {
-                    let id = words[2];
-                    manager.stop_server(id);
-                    match store.set_server_state(id, NodeState::Disabled) {
-                        Ok(()) => vec![format!("Server '{id}' disabled.")],
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                "chat" => {
-                    if words.len() < 4 {
-                        return vec!["Usage: disable chat <server_id> <chat_id>".into()];
-                    }
-                    let server_id = words[2];
-                    let chat_id = words[3];
-                    match store.set_chat_state(server_id, chat_id, NodeState::Disabled) {
-                        Ok(()) => {
-                            let _ = manager.restart_server(server_id);
-                            vec![format!("Chat '{server_id}/{chat_id}' disabled.")]
-                        }
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                _ => vec!["Usage: disable server <id> | disable chat <server_id> <chat_id>".into()],
-            }
-        }
-        "list" => {
-            if words.len() < 2 {
-                return vec!["Usage: list servers | list chats [server_id] | list contacts".into()];
-            }
-            let target = words[1].to_lowercase();
-            match target.as_str() {
-                "contacts" => {
-                    match store.list_contacts() {
-                        Ok(contacts) => {
-                            if contacts.is_empty() {
-                                vec!["No contacts.".into()]
-                            } else {
-                                contacts.iter()
-                                    .map(|c| format!("  {} ({}) {}", c.name, c.id, c.onion_address))
-                                    .collect()
-                            }
-                        }
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                "servers" => {
-                    match store.list_servers() {
-                        Ok(servers) => {
-                            if servers.is_empty() {
-                                vec!["No servers configured.".into()]
-                            } else {
-                                servers.iter()
-                                    .map(|s| {
-                                        let running = if manager.is_running(&s.id) { " [live]" } else { "" };
-                                        format!("  {} ({}) [{}]{}", s.name, s.address, s.state, running)
-                                    })
-                                    .collect()
-                            }
-                        }
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                "chats" => {
-                    let server_id = words.get(2).copied();
-                    match server_id {
-                        Some(sid) => {
-                            match store.list_chats_for_server(sid) {
-                                Ok(chats) => {
-                                    if chats.is_empty() {
-                                        vec![format!("No chats for server '{sid}'.")]
-                                    } else {
-                                        chats.iter()
-                                            .map(|c| format!("  {}/{} ({}) [{}]", c.server_id, c.chat_id, c.name, c.state))
-                                            .collect()
-                                    }
-                                }
-                                Err(e) => vec![format!("Error: {e}")],
-                            }
-                        }
-                        None => {
-                            match store.list_servers() {
-                                Ok(servers) => {
-                                    let mut lines = Vec::new();
-                                    for s in &servers {
-                                        match store.list_chats_for_server(&s.id) {
-                                            Ok(chats) => {
-                                                for c in &chats {
-                                                    lines.push(format!(
-                                                        "  {}/{} ({}) [{}]",
-                                                        c.server_id, c.chat_id, c.name, c.state,
-                                                    ));
-                                                }
-                                            }
-                                            Err(e) => lines.push(format!("  Error listing chats for '{}': {e}", s.id)),
-                                        }
-                                    }
-                                    if lines.is_empty() {
-                                        vec!["No chats configured.".into()]
-                                    } else {
-                                        lines
-                                    }
-                                }
-                                Err(e) => vec![format!("Error: {e}")],
-                            }
-                        }
-                    }
-                }
-                _ => vec!["Usage: list servers | list chats [server_id] | list contacts".into()],
-            }
-        }
-        "send" => {
-            // send <server_id> <chat_id> <message...>
-            let parts: Vec<&str> = input.splitn(4, ' ').collect();
-            if parts.len() < 4 {
-                return vec!["Usage: send <server_id> <chat_id> <message>".into()];
-            }
-            let server_id = parts[1];
-            let chat_id = parts[2];
-            let message = parts[3];
-
-            let server = match store.load_server(server_id) {
-                Ok(s) => s,
-                Err(e) => return vec![format!("Error: {e}")],
-            };
-            let chat = match store.load_chat(server_id, chat_id) {
-                Ok(c) => c,
-                Err(e) => return vec![format!("Error: {e}")],
-            };
-            match Transport::connect(&server.address, &server.shared_key_bytes).await {
-                Ok(mut transport) => {
-                    match transport.send_message(chat_id, message, &chat.encryption_key_bytes).await {
-                        Ok(resp) => {
-                            if resp.accepted {
-                                vec![]
-                            } else {
-                                vec![format!("Rejected: {}", resp.error)]
-                            }
-                        }
-                        Err(e) => vec![format!("Send error: {e}")],
-                    }
-                }
-                Err(e) => vec![format!("Connection error: {e}")],
-            }
-        }
-        "history" => {
-            // history <server_id> <chat_id> [--limit N]
-            if words.len() < 3 {
-                return vec!["Usage: history <server_id> <chat_id> [--limit N]".into()];
-            }
-            let server_id = words[1];
-            let chat_id = words[2];
-
-            let mut limit = 50u32;
-            for i in 3..words.len() {
-                if words[i] == "--limit" {
-                    if let Some(n) = words.get(i + 1) {
-                        limit = n.parse().unwrap_or(50);
-                    }
-                }
-            }
-            let server = match store.load_server(server_id) {
-                Ok(s) => s,
-                Err(e) => return vec![format!("Error: {e}")],
-            };
-            let chat = match store.load_chat(server_id, chat_id) {
-                Ok(c) => c,
-                Err(e) => return vec![format!("Error: {e}")],
-            };
-            match Transport::connect(&server.address, &server.shared_key_bytes).await {
-                Ok(mut transport) => {
-                    match transport.get_history(chat_id, 0, 0, limit).await {
-                        Ok(resp) => {
-                            let mut lines = Vec::new();
-                            for msg in &resp.messages {
-                                let text = crate::transport::decrypt_payload(
-                                    &msg.encrypted_payload,
-                                    &chat.encryption_key_bytes,
-                                    &msg.chat_id,
-                                ).unwrap_or_else(|_| "<decryption failed>".into());
-                                let ts = chrono::DateTime::from_timestamp_millis(msg.timestamp_ms)
-                                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                                    .unwrap_or_else(|| msg.timestamp_ms.to_string());
-                                lines.push(format!("[{ts}] {text}"));
-                            }
-                            if lines.is_empty() {
-                                lines.push("No messages.".into());
-                            }
-                            lines
-                        }
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                Err(e) => vec![format!("Connection error: {e}")],
-            }
-        }
-        "admin" => {
-            // admin <server_id> <subcommand> [arg]
-            if words.len() < 3 {
-                return vec!["Usage: admin <server_id> <create-chat|delete-chat|list-chats> [args]".into()];
-            }
-            let server_id = words[1];
-            let sub = words[2].to_lowercase();
-            let sub_arg = words.get(3).copied();
-
-            let server = match store.load_server(server_id) {
-                Ok(s) => s,
-                Err(e) => return vec![format!("Error: {e}")],
-            };
-            let admin_key = match server.admin_key_bytes {
-                Some(k) => k,
-                None => return vec!["No admin key configured for this server.".into()],
-            };
-            let mut transport = match Transport::connect(&server.address, &server.shared_key_bytes).await {
-                Ok(t) => t,
-                Err(e) => return vec![format!("Connection error: {e}")],
-            };
-            match sub.as_str() {
-                "create-chat" => {
-                    let id = match sub_arg {
-                        Some(id) if !id.is_empty() => id,
-                        _ => return vec!["Usage: admin <server_id> create-chat <chat_id>".into()],
-                    };
-                    match transport.create_chat(&admin_key, id, 1000, 10_485_760).await {
-                        Ok(resp) => {
-                            if resp.success {
-                                vec![format!("Chat '{id}' created on '{server_id}'")]
-                            } else {
-                                vec![format!("Failed: {}", resp.error)]
-                            }
-                        }
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                "delete-chat" => {
-                    let id = match sub_arg {
-                        Some(id) if !id.is_empty() => id,
-                        _ => return vec!["Usage: admin <server_id> delete-chat <chat_id>".into()],
-                    };
-                    match transport.delete_chat(&admin_key, id).await {
-                        Ok(resp) => {
-                            if resp.success {
-                                vec![format!("Chat '{id}' deleted from '{server_id}'")]
-                            } else {
-                                vec![format!("Failed: {}", resp.error)]
-                            }
-                        }
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                "list-chats" => {
-                    match transport.list_chats(&admin_key).await {
-                        Ok(resp) => {
-                            if resp.chats.is_empty() {
-                                vec!["No chats.".into()]
-                            } else {
-                                resp.chats.iter()
-                                    .map(|c| format!("  {} (earliest: {}, latest: {})", c.chat_id, c.earliest_timestamp_ms, c.latest_timestamp_ms))
-                                    .collect()
-                            }
-                        }
-                        Err(e) => vec![format!("Error: {e}")],
-                    }
-                }
-                _ => vec![format!("Unknown admin command: {sub}")],
-            }
-        }
-        "share-listen" => {
-            if share_state.is_some() {
-                return vec!["Share listener already running. Use 'share-stop' first.".into()];
-            }
-            let port: u16 = words.get(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(17777);
-            let cancel = CancellationToken::new();
-            match crate::share::listen(port, store.clone(), event_tx.clone(), cancel.clone()).await {
-                Ok((addr, tor_child)) => {
-                    *share_state = Some((cancel, tor_child));
-                    vec![format!("Share listener started: {addr}")]
-                }
-                Err(e) => vec![format!("Error: {e}")],
-            }
-        }
-        "share-stop" => {
-            match share_state.take() {
-                Some((cancel, mut tor_child)) => {
-                    cancel.cancel();
-                    if let Some(ref mut child) = tor_child {
-                        let _ = child.kill().await;
-                    }
-                    vec!["Share listener stopped.".into()]
-                }
-                None => vec!["No share listener running.".into()],
-            }
+        "servers" => {
+            app.screen = Screen::Servers;
+            refresh_servers(app, store);
+            return false;
         }
         "share" => {
-            if words.len() < 2 {
-                return vec!["Usage: share server <server_id> <contact_id> | share chat <server_id> <chat_id> <contact_id>".into()];
-            }
-            let target = words[1].to_lowercase();
-            match target.as_str() {
-                "server" => {
-                    if words.len() < 4 {
-                        return vec!["Usage: share server <server_id> <contact_id>".into()];
-                    }
-                    let server_id = words[2];
-                    let contact_id = words[3];
+            app.screen = Screen::Share;
+            return false;
+        }
+        _ => {}
+    }
 
-                    let server = match store.load_server(server_id) {
-                        Ok(s) => s,
-                        Err(e) => return vec![format!("Error: {e}")],
-                    };
-                    let contact = match store.load_contact(contact_id) {
-                        Ok(c) => c,
-                        Err(e) => return vec![format!("Error: {e}")],
-                    };
-                    let identity = match store.load_identity() {
-                        Ok(Some(id)) => id,
-                        Ok(None) => return vec!["No identity found.".into()],
-                        Err(e) => return vec![format!("Error: {e}")],
-                    };
+    // ── Screen-specific commands ─────────────────────────────────────────────
+    match &app.screen.clone() {
+        Screen::Contacts => exec_contacts(trimmed, &words, app, store).await,
+        Screen::Servers  => exec_servers(trimmed, &words, app, store, manager, event_tx, share_state).await,
+        Screen::Chats { server_id } => {
+            let sid = server_id.clone();
+            exec_chats(trimmed, &words, &sid, app, store, manager).await
+        }
+        Screen::Share => exec_share(trimmed, &words, app, store, event_tx, share_state).await,
+    }
 
-                    let data = ShareData::Server(ServerShareData {
-                        id: server.id.clone(),
-                        host: server.address.clone(),
-                        shared_key: server.shared_key_bytes.clone(),
-                        admin_key: server.admin_key_bytes.clone(),
-                    });
+    false
+}
 
-                    match crate::share::send_share(data, &contact, &identity, 17777).await {
-                        Ok(()) => vec![format!("Shared server '{}' with {}", server_id, contact_id)],
-                        Err(e) => vec![format!("Share error: {e}")],
-                    }
+// ── Contacts commands ─────────────────────────────────────────────────────────
+
+async fn exec_contacts(_input: &str, words: &[&str], app: &mut App, store: &Store) {
+    let cmd = words[0].to_lowercase();
+    match cmd.as_str() {
+        "help" | "?" => {
+            app.set_info(vec![
+                "contacts commands:".into(),
+                "  export-self <path>     Export own identity card (binary)".into(),
+                "  export <path>          Export selected contact (binary)".into(),
+                "  load <path> <name>     Import contact from binary file".into(),
+                "  del                    Delete selected contact".into(),
+                "  rename <new_name>      Rename selected contact".into(),
+                "  whoami                 Show own identity info".into(),
+                "  servers / share        Switch screen".into(),
+            ]);
+        }
+        "whoami" => {
+            match store.load_identity() {
+                Ok(Some(id)) => {
+                    let onion = {
+                        let arr: [u8; 32] = id.tor_pk_bytes.clone().try_into().unwrap_or([0u8; 32]);
+                        match torut::onion::TorPublicKeyV3::from_bytes(&arr) {
+                            Ok(pk) => pk.get_onion_address().to_string(),
+                            Err(_) => "<invalid tor key>".into(),
+                        }
+                    };
+                    app.set_info(vec![
+                        format!("ID:         {}", id.id),
+                        format!("Onion:      {}", onion),
+                        format!("Signing PK: {}", hex::encode(&id.signing_pk_bytes)),
+                    ]);
                 }
-                "chat" => {
-                    if words.len() < 5 {
-                        return vec!["Usage: share chat <server_id> <chat_id> <contact_id>".into()];
-                    }
-                    let server_id = words[2];
-                    let chat_id = words[3];
-                    let contact_id = words[4];
-
-                    let server = match store.load_server(server_id) {
-                        Ok(s) => s,
-                        Err(e) => return vec![format!("Error: {e}")],
-                    };
-                    let chat = match store.load_chat(server_id, chat_id) {
-                        Ok(c) => c,
-                        Err(e) => return vec![format!("Error: {e}")],
-                    };
-                    let contact = match store.load_contact(contact_id) {
-                        Ok(c) => c,
-                        Err(e) => return vec![format!("Error: {e}")],
-                    };
-                    let identity = match store.load_identity() {
-                        Ok(Some(id)) => id,
-                        Ok(None) => return vec!["No identity found.".into()],
-                        Err(e) => return vec![format!("Error: {e}")],
-                    };
-
-                    let data = ShareData::Chat(ChatShareData {
-                        server_id: server_id.to_string(),
-                        chat_id: chat_id.to_string(),
-                        name: chat.name.clone(),
-                        encryption_key: chat.encryption_key_bytes.clone(),
-                        server_admin_key: server.admin_key_bytes.clone(),
-                    });
-
-                    match crate::share::send_share(data, &contact, &identity, 17777).await {
-                        Ok(()) => vec![format!("Shared chat '{}/{}' with {}", server_id, chat_id, contact_id)],
-                        Err(e) => vec![format!("Share error: {e}")],
-                    }
-                }
-                _ => vec!["Usage: share server <server_id> <contact_id> | share chat <server_id> <chat_id> <contact_id>".into()],
+                Ok(None) => app.set_error("No identity found"),
+                Err(e) => app.set_error(format!("Error: {e}")),
             }
         }
-        "deploy-server" => {
-            if words.len() < 5 {
-                return vec!["Usage: deploy-server <ssh_user> <ssh_ip> <ssh_pass> <server_id>".into()];
+        "export-self" => {
+            if words.len() < 2 {
+                app.set_error("Usage: export-self <path>"); return;
+            }
+            let path = shellexpand::tilde(words[1]);
+            match store.load_identity() {
+                Ok(Some(id)) => {
+                    let arr: [u8; 32] = match id.tor_pk_bytes.clone().try_into() {
+                        Ok(a) => a,
+                        Err(_) => { app.set_error("Invalid tor public key length"); return; }
+                    };
+                    let onion = match torut::onion::TorPublicKeyV3::from_bytes(&arr) {
+                        Ok(pk) => pk.get_onion_address().to_string(),
+                        Err(_) => { app.set_error("Invalid tor public key"); return; }
+                    };
+                    let card = ContactCard {
+                        signing_pk: id.signing_pk_bytes,
+                        tor_pk: id.tor_pk_bytes,
+                        onion_address: onion,
+                    };
+                    match card.to_bytes() {
+                        Ok(bytes) => match std::fs::write(path.as_ref(), &bytes) {
+                            Ok(()) => app.set_info(vec![format!("Exported to {}", path)]),
+                            Err(e) => app.set_error(format!("Write error: {e}")),
+                        },
+                        Err(e) => app.set_error(format!("Serialize error: {e}")),
+                    }
+                }
+                Ok(None) => app.set_error("No identity found"),
+                Err(e) => app.set_error(format!("Error: {e}")),
+            }
+        }
+        "export" => {
+            if words.len() < 2 {
+                app.set_error("Usage: export <path>"); return;
+            }
+            if app.contacts.is_empty() {
+                app.set_error("No contacts"); return;
+            }
+            let contact = &app.contacts[app.contacts_cursor];
+            let path = shellexpand::tilde(words[1]);
+            let card = ContactCard {
+                signing_pk: contact.signing_pk_bytes.clone(),
+                tor_pk: contact.tor_pk_bytes.clone(),
+                onion_address: contact.onion_address.clone(),
+            };
+            match card.to_bytes() {
+                Ok(bytes) => match std::fs::write(path.as_ref(), &bytes) {
+                    Ok(()) => app.set_info(vec![format!("Exported '{}' to {}", contact.name, path)]),
+                    Err(e) => app.set_error(format!("Write error: {e}")),
+                },
+                Err(e) => app.set_error(format!("Serialize error: {e}")),
+            }
+        }
+        "load" => {
+            if words.len() < 3 {
+                app.set_error("Usage: load <path> <name>"); return;
+            }
+            let path = shellexpand::tilde(words[1]);
+            let name = words[2..].join(" ");
+            match std::fs::read(path.as_ref()) {
+                Ok(bytes) => match ContactCard::from_bytes(&bytes) {
+                    Ok(card) => match store.save_contact(&card, Some(&name)) {
+                        Ok(()) => {
+                            refresh_contacts(app, store);
+                            app.set_info(vec![format!("Contact '{}' imported", name)]);
+                        }
+                        Err(e) => app.set_error(format!("Save error: {e}")),
+                    },
+                    Err(e) => app.set_error(format!("Parse error: {e}")),
+                },
+                Err(e) => app.set_error(format!("Read error: {e}")),
+            }
+        }
+        "del" => {
+            if app.contacts.is_empty() {
+                app.set_error("No contacts"); return;
+            }
+            let id = app.contacts[app.contacts_cursor].id.clone();
+            match store.delete_contact(&id) {
+                Ok(()) => { refresh_contacts(app, store); }
+                Err(e) => app.set_error(format!("Error: {e}")),
+            }
+        }
+        "rename" => {
+            if words.len() < 2 {
+                app.set_error("Usage: rename <new_name>"); return;
+            }
+            if app.contacts.is_empty() {
+                app.set_error("No contacts"); return;
+            }
+            let id = app.contacts[app.contacts_cursor].id.clone();
+            let new_name = words[1..].join(" ");
+            match store.rename_contact(&id, &new_name) {
+                Ok(()) => { refresh_contacts(app, store); }
+                Err(e) => app.set_error(format!("Error: {e}")),
+            }
+        }
+        _ => app.set_error(format!("Unknown command: {}. Type 'help'.", words[0])),
+    }
+}
+
+// ── Servers commands ──────────────────────────────────────────────────────────
+
+async fn exec_servers(
+    _input: &str,
+    words: &[&str],
+    app: &mut App,
+    store: &Store,
+    manager: &mut ConnectionManager,
+    _event_tx: &mpsc::UnboundedSender<LiveEvent>,
+    _share_state: &mut Option<(CancellationToken, Option<tokio::process::Child>)>,
+) {
+    let cmd = words[0].to_lowercase();
+    match cmd.as_str() {
+        "help" | "?" => {
+            app.set_info(vec![
+                "servers commands:".into(),
+                "  enable                 Enable selected server".into(),
+                "  disable                Disable selected server".into(),
+                "  rename <name>          Rename selected server".into(),
+                "  del                    Delete selected server".into(),
+                "  chats                  Go to chats of selected server".into(),
+                "  import <path>          Import server from binary file".into(),
+                "  export <path>          Export selected server to binary file".into(),
+                "  deploy <user> <ip> <pass>  Deploy server via SSH".into(),
+                "  remove <user> <ip> <pass>  Remove server via SSH".into(),
+                "  admin create-chat <id> Create chat on selected server".into(),
+                "  admin delete-chat <id> Delete chat on selected server".into(),
+                "  admin list-chats       List chats on selected server".into(),
+                "  contacts / share       Switch screen".into(),
+            ]);
+        }
+        "chats" => {
+            if app.servers.is_empty() {
+                app.set_error("No servers"); return;
+            }
+            let sid = app.servers[app.servers_cursor].id.clone();
+            app.screen = Screen::Chats { server_id: sid };
+            app.chats_cursor = 0;
+            refresh_chats(app, store);
+        }
+        "enable" => {
+            if app.servers.is_empty() {
+                app.set_error("No servers"); return;
+            }
+            let id = app.servers[app.servers_cursor].id.clone();
+            if let Err(e) = store.set_server_state(&id, NodeState::Enabled) {
+                app.set_error(format!("Error: {e}")); return;
+            }
+            if let Err(e) = manager.start_server(&id) {
+                app.set_error(format!("Enabled but connect failed: {e}"));
+            }
+            refresh_servers(app, store);
+        }
+        "disable" => {
+            if app.servers.is_empty() {
+                app.set_error("No servers"); return;
+            }
+            let id = app.servers[app.servers_cursor].id.clone();
+            manager.stop_server(&id);
+            if let Err(e) = store.set_server_state(&id, NodeState::Disabled) {
+                app.set_error(format!("Error: {e}")); return;
+            }
+            refresh_servers(app, store);
+        }
+        "rename" => {
+            if words.len() < 2 {
+                app.set_error("Usage: rename <new_name>"); return;
+            }
+            if app.servers.is_empty() {
+                app.set_error("No servers"); return;
+            }
+            let id = app.servers[app.servers_cursor].id.clone();
+            let name = words[1..].join(" ");
+            if let Err(e) = store.rename_server(&id, &name) {
+                app.set_error(format!("Error: {e}")); return;
+            }
+            refresh_servers(app, store);
+        }
+        "del" => {
+            if app.servers.is_empty() {
+                app.set_error("No servers"); return;
+            }
+            let id = app.servers[app.servers_cursor].id.clone();
+            manager.stop_server(&id);
+            if let Err(e) = store.delete_server(&id) {
+                app.set_error(format!("Error: {e}")); return;
+            }
+            refresh_servers(app, store);
+        }
+        "import" => {
+            if words.len() < 2 {
+                app.set_error("Usage: import <path>"); return;
+            }
+            let path_str = shellexpand::tilde(words[1]);
+            match ServerCard::load(std::path::Path::new(path_str.as_ref())) {
+                Ok(card) => {
+                    let id = card.id.clone();
+                    match store.save_server_card(&card) {
+                        Ok(()) => {
+                            refresh_servers(app, store);
+                            app.set_info(vec![format!("Server '{}' imported", id)]);
+                        }
+                        Err(e) => app.set_error(format!("Save error: {e}")),
+                    }
+                }
+                Err(e) => app.set_error(format!("Load error: {e}")),
+            }
+        }
+        "export" => {
+            if words.len() < 2 {
+                app.set_error("Usage: export <path>"); return;
+            }
+            if app.servers.is_empty() {
+                app.set_error("No servers"); return;
+            }
+            let id = app.servers[app.servers_cursor].id.clone();
+            let path_str = shellexpand::tilde(words[1]);
+            match store.export_server_card(&id) {
+                Ok(card) => match card.save(std::path::Path::new(path_str.as_ref())) {
+                    Ok(()) => app.set_info(vec![format!("Exported server '{}' to {}", id, path_str)]),
+                    Err(e) => app.set_error(format!("Write error: {e}")),
+                },
+                Err(e) => app.set_error(format!("Error: {e}")),
+            }
+        }
+        "deploy" => {
+            if words.len() < 4 {
+                app.set_error("Usage: deploy <ssh_user> <ssh_ip> <ssh_pass>"); return;
             }
             let ssh_user = words[1];
             let ssh_ip = words[2];
             let ssh_pass = words[3];
-            let server_id = words[4];
+            let server_id = format!("srv-{}", address_short(ssh_ip));
 
             let creds = crate::setup_server::SshCredentials::new(
                 ssh_user.to_string(),
                 ssh_ip.to_string(),
                 ssh_pass.to_string(),
             );
+            let user_key = new_aes_key_hex();
+            let admin_key = new_aes_key_hex();
+            let address = format!("http://{}:50051", ssh_ip);
 
-            let user_key = {
-                use m_core::crypto::algorithms::symmetric::Aes256Gcm;
-                use m_core::crypto::{CryptoKey, SymmetricCipher};
-                hex::encode(Aes256Gcm::new().get_key().as_bytes())
-            };
-            let admin_key = {
-                use m_core::crypto::algorithms::symmetric::Aes256Gcm;
-                use m_core::crypto::{CryptoKey, SymmetricCipher};
-                hex::encode(Aes256Gcm::new().get_key().as_bytes())
-            };
-            let server_address = format!("http://{}:50051", ssh_ip);
-
-            manager.stop_server(server_id);
-
+            manager.stop_server(&server_id);
             if let Err(e) = crate::setup_server::setup_server(&creds, &user_key, &admin_key).await {
-                return vec![format!("Deploy failed: {e}")];
+                app.set_error(format!("Deploy failed: {e}")); return;
             }
-
-            let import = crate::config::ServerImport {
-                connection: crate::config::ServerConnection {
-                    id: server_id.to_string(),
-                    server_address: server_address.clone(),
-                },
-                auth: crate::config::ServerAuth {
-                    shared_key: user_key.clone(),
-                    admin_key: Some(admin_key.clone()),
-                },
+            let card = ServerCard {
+                id: server_id.clone(),
+                address,
+                shared_key: hex::decode(&user_key).unwrap_or_default(),
+                admin_key: Some(hex::decode(&admin_key).unwrap_or_default()),
             };
-            if let Err(e) = store.save_server(&import) {
-                return vec![format!("Server deployed but DB save failed: {e}")];
+            if let Err(e) = store.save_server_card(&card) {
+                app.set_error(format!("Deployed but DB save failed: {e}")); return;
             }
-            if let Err(e) = store.set_server_state(server_id, NodeState::Enabled) {
-                return vec![format!("Server deployed but could not enable: {e}")];
-            }
-
-            let mut out = vec![
-                format!("Server '{}' deployed at {}", server_id, server_address),
+            let _ = store.set_server_state(&server_id, NodeState::Enabled);
+            let _ = manager.start_server(&server_id);
+            refresh_servers(app, store);
+            app.set_info(vec![
+                format!("Server '{}' deployed", server_id),
                 format!("  user_key:  {}", user_key),
                 format!("  admin_key: {}", admin_key),
-            ];
-            if let Err(e) = manager.start_server(server_id) {
-                out.push(format!("Warning: could not start connection: {e}"));
-            } else {
-                out.push(format!("Connection started."));
-            }
-            out
+            ]);
         }
-        "remove-server" => {
-            if words.len() < 5 {
-                return vec!["Usage: remove-server <ssh_user> <ssh_ip> <ssh_pass> <server_id>".into()];
+        "remove" => {
+            if words.len() < 4 {
+                app.set_error("Usage: remove <ssh_user> <ssh_ip> <ssh_pass>"); return;
+            }
+            if app.servers.is_empty() {
+                app.set_error("No servers"); return;
             }
             let creds = crate::setup_server::SshCredentials::new(
                 words[1].to_string(),
                 words[2].to_string(),
                 words[3].to_string(),
             );
-            let server_id = words[4];
-
-            manager.stop_server(server_id);
-
+            let id = app.servers[app.servers_cursor].id.clone();
+            manager.stop_server(&id);
             if let Err(e) = crate::setup_server::remove_server(&creds).await {
-                return vec![format!("Remote removal failed: {e}")];
+                app.set_error(format!("Remote removal failed: {e}")); return;
             }
-
-            match store.set_server_state(server_id, NodeState::Disabled) {
-                Ok(()) => vec![format!("Server '{}' removed and disabled.", server_id)],
-                Err(_) => vec![format!("Remote server removed. No local record found for '{}'.", server_id)],
+            let _ = store.delete_server(&id);
+            refresh_servers(app, store);
+        }
+        "admin" => {
+            if words.len() < 2 {
+                app.set_error("Usage: admin <create-chat|delete-chat|list-chats> [args]"); return;
+            }
+            if app.servers.is_empty() {
+                app.set_error("No servers"); return;
+            }
+            let server = app.servers[app.servers_cursor].clone();
+            let admin_key = match server.admin_key_bytes.clone() {
+                Some(k) => k,
+                None => { app.set_error("No admin key for this server"); return; }
+            };
+            let mut transport = match Transport::connect(&server.address, &server.shared_key_bytes).await {
+                Ok(t) => t,
+                Err(e) => { app.set_error(format!("Connection error: {e}")); return; }
+            };
+            let sub = words[1].to_lowercase();
+            match sub.as_str() {
+                "create-chat" => {
+                    let id = match words.get(2) {
+                        Some(s) if !s.is_empty() => *s,
+                        _ => { app.set_error("Usage: admin create-chat <chat_id>"); return; }
+                    };
+                    match transport.create_chat(&admin_key, id, 1000, 10_485_760).await {
+                        Ok(r) if r.success => app.set_info(vec![format!("Chat '{}' created", id)]),
+                        Ok(r) => app.set_error(format!("Failed: {}", r.error)),
+                        Err(e) => app.set_error(format!("Error: {e}")),
+                    }
+                }
+                "delete-chat" => {
+                    let id = match words.get(2) {
+                        Some(s) if !s.is_empty() => *s,
+                        _ => { app.set_error("Usage: admin delete-chat <chat_id>"); return; }
+                    };
+                    match transport.delete_chat(&admin_key, id).await {
+                        Ok(r) if r.success => app.set_info(vec![format!("Chat '{}' deleted", id)]),
+                        Ok(r) => app.set_error(format!("Failed: {}", r.error)),
+                        Err(e) => app.set_error(format!("Error: {e}")),
+                    }
+                }
+                "list-chats" => {
+                    match transport.list_chats(&admin_key).await {
+                        Ok(r) => {
+                            if r.chats.is_empty() {
+                                app.set_info(vec!["No chats on server".into()]);
+                            } else {
+                                app.set_info(r.chats.iter().map(|c| {
+                                    format!("  {} ({}..{})", c.chat_id, c.earliest_timestamp_ms, c.latest_timestamp_ms)
+                                }).collect());
+                            }
+                        }
+                        Err(e) => app.set_error(format!("Error: {e}")),
+                    }
+                }
+                _ => app.set_error(format!("Unknown admin command: {sub}")),
             }
         }
-        _ => vec![format!("Unknown command: {cmd}. Type 'help' for list.")],
+        _ => app.set_error(format!("Unknown command: {}. Type 'help'.", words[0])),
     }
 }
 
-pub async fn run(_config: ClientConfig, store: Store) -> Result<()> {
+// ── Chats commands ────────────────────────────────────────────────────────────
+
+async fn exec_chats(
+    input: &str,
+    words: &[&str],
+    server_id: &str,
+    app: &mut App,
+    store: &Store,
+    manager: &mut ConnectionManager,
+) {
+    let cmd = words[0].to_lowercase();
+    match cmd.as_str() {
+        "help" | "?" => {
+            app.set_info(vec![
+                "servers/chats commands:".into(),
+                "  enable                 Enable selected chat".into(),
+                "  disable                Disable selected chat".into(),
+                "  rename <name>          Rename selected chat".into(),
+                "  del                    Delete selected chat".into(),
+                "  live                   Enter live mode for selected chat".into(),
+                "  send <message>         Send message to selected chat".into(),
+                "  history [--limit N]    Fetch chat history".into(),
+                "  import <path>          Import chat from binary file".into(),
+                "  export <path>          Export selected chat to binary file".into(),
+                "  servers                Back to server list".into(),
+            ]);
+        }
+        "live" => {
+            if app.chats.is_empty() {
+                app.set_error("No chats"); return;
+            }
+            let chat = &app.chats[app.chats_cursor];
+            app.live_mode = LiveMode::On {
+                server_id: server_id.to_string(),
+                chat_id: chat.chat_id.clone(),
+                messages: VecDeque::new(),
+                scroll: 0,
+            };
+        }
+        "enable" => {
+            if app.chats.is_empty() {
+                app.set_error("No chats"); return;
+            }
+            let chat = app.chats[app.chats_cursor].chat_id.clone();
+            if let Err(e) = store.set_chat_state(server_id, &chat, NodeState::Enabled) {
+                app.set_error(format!("Error: {e}")); return;
+            }
+            let _ = manager.restart_server(server_id);
+            refresh_chats(app, store);
+        }
+        "disable" => {
+            if app.chats.is_empty() {
+                app.set_error("No chats"); return;
+            }
+            let chat = app.chats[app.chats_cursor].chat_id.clone();
+            if let Err(e) = store.set_chat_state(server_id, &chat, NodeState::Disabled) {
+                app.set_error(format!("Error: {e}")); return;
+            }
+            let _ = manager.restart_server(server_id);
+            refresh_chats(app, store);
+        }
+        "rename" => {
+            if words.len() < 2 {
+                app.set_error("Usage: rename <new_name>"); return;
+            }
+            if app.chats.is_empty() {
+                app.set_error("No chats"); return;
+            }
+            let chat_id = app.chats[app.chats_cursor].chat_id.clone();
+            let name = words[1..].join(" ");
+            if let Err(e) = store.rename_chat(server_id, &chat_id, &name) {
+                app.set_error(format!("Error: {e}")); return;
+            }
+            refresh_chats(app, store);
+        }
+        "del" => {
+            if app.chats.is_empty() {
+                app.set_error("No chats"); return;
+            }
+            let chat_id = app.chats[app.chats_cursor].chat_id.clone();
+            if let Err(e) = store.delete_chat(server_id, &chat_id) {
+                app.set_error(format!("Error: {e}")); return;
+            }
+            if let LiveMode::On { chat_id: live_cid, .. } = &app.live_mode {
+                if *live_cid == chat_id {
+                    app.live_mode = LiveMode::Off;
+                }
+            }
+            refresh_chats(app, store);
+        }
+        "import" => {
+            if words.len() < 2 {
+                app.set_error("Usage: import <path>"); return;
+            }
+            let path_str = shellexpand::tilde(words[1]);
+            match ChatCard::load(std::path::Path::new(path_str.as_ref())) {
+                Ok(card) => {
+                    let display = format!("{}/{}", card.server_id, card.chat_id);
+                    match store.save_chat_card(&card) {
+                        Ok(()) => {
+                            refresh_chats(app, store);
+                            app.set_info(vec![format!("Chat '{}' imported", display)]);
+                        }
+                        Err(e) => app.set_error(format!("Save error: {e}")),
+                    }
+                }
+                Err(e) => app.set_error(format!("Load error: {e}")),
+            }
+        }
+        "export" => {
+            if words.len() < 2 {
+                app.set_error("Usage: export <path>"); return;
+            }
+            if app.chats.is_empty() {
+                app.set_error("No chats"); return;
+            }
+            let chat_id = app.chats[app.chats_cursor].chat_id.clone();
+            let path_str = shellexpand::tilde(words[1]);
+            match store.export_chat_card(server_id, &chat_id) {
+                Ok(card) => match card.save(std::path::Path::new(path_str.as_ref())) {
+                    Ok(()) => app.set_info(vec![format!("Exported chat '{}/{}' to {}", server_id, chat_id, path_str)]),
+                    Err(e) => app.set_error(format!("Write error: {e}")),
+                },
+                Err(e) => app.set_error(format!("Error: {e}")),
+            }
+        }
+        "send" => {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            if parts.len() < 2 {
+                app.set_error("Usage: send <message>"); return;
+            }
+            let message = parts[1];
+            let chat_id = match active_chat_id(app) {
+                Some(id) => id,
+                None => {
+                    if app.chats.is_empty() { app.set_error("No chat selected"); return; }
+                    app.chats[app.chats_cursor].chat_id.clone()
+                }
+            };
+            let server = match store.load_server(server_id) {
+                Ok(s) => s,
+                Err(e) => { app.set_error(format!("Error: {e}")); return; }
+            };
+            let chat = match store.load_chat(server_id, &chat_id) {
+                Ok(c) => c,
+                Err(e) => { app.set_error(format!("Error: {e}")); return; }
+            };
+            match Transport::connect(&server.address, &server.shared_key_bytes).await {
+                Ok(mut t) => match t.send_message(&chat_id, message, &chat.encryption_key_bytes).await {
+                    Ok(r) if r.accepted => {}
+                    Ok(r) => app.set_error(format!("Rejected: {}", r.error)),
+                    Err(e) => app.set_error(format!("Send error: {e}")),
+                },
+                Err(e) => app.set_error(format!("Connection error: {e}")),
+            }
+        }
+        "history" => {
+            let chat_id = match active_chat_id(app) {
+                Some(id) => id,
+                None => {
+                    if app.chats.is_empty() { app.set_error("No chat selected"); return; }
+                    app.chats[app.chats_cursor].chat_id.clone()
+                }
+            };
+            let mut limit = 50u32;
+            for i in 1..words.len() {
+                if words[i] == "--limit" {
+                    if let Some(n) = words.get(i + 1) { limit = n.parse().unwrap_or(50); }
+                }
+            }
+            let server = match store.load_server(server_id) {
+                Ok(s) => s,
+                Err(e) => { app.set_error(format!("Error: {e}")); return; }
+            };
+            let chat = match store.load_chat(server_id, &chat_id) {
+                Ok(c) => c,
+                Err(e) => { app.set_error(format!("Error: {e}")); return; }
+            };
+            match Transport::connect(&server.address, &server.shared_key_bytes).await {
+                Ok(mut t) => match t.get_history(&chat_id, 0, 0, limit).await {
+                    Ok(resp) => {
+                        let lines: Vec<String> = resp.messages.iter().map(|msg| {
+                            let text = crate::transport::decrypt_payload(
+                                &msg.encrypted_payload,
+                                &chat.encryption_key_bytes,
+                                &msg.chat_id,
+                            ).unwrap_or_else(|_| "<decryption failed>".into());
+                            let ts = chrono::DateTime::from_timestamp_millis(msg.timestamp_ms)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| msg.timestamp_ms.to_string());
+                            format!("[{ts}] {text}")
+                        }).collect();
+                        if lines.is_empty() {
+                            app.set_info(vec!["No messages".into()]);
+                        } else {
+                            // Inject into live panel
+                            if let LiveMode::On { messages, .. } = &mut app.live_mode {
+                                for l in &lines { messages.push_back(l.clone()); }
+                            } else {
+                                app.set_info(lines);
+                            }
+                        }
+                    }
+                    Err(e) => app.set_error(format!("Error: {e}")),
+                },
+                Err(e) => app.set_error(format!("Connection error: {e}")),
+            }
+        }
+        _ => app.set_error(format!("Unknown command: {}. Type 'help'.", words[0])),
+    }
+}
+
+fn active_chat_id(app: &App) -> Option<String> {
+    if let LiveMode::On { chat_id, .. } = &app.live_mode {
+        Some(chat_id.clone())
+    } else {
+        None
+    }
+}
+
+// ── Share commands ────────────────────────────────────────────────────────────
+
+async fn exec_share(
+    _input: &str,
+    words: &[&str],
+    app: &mut App,
+    store: &Store,
+    event_tx: &mpsc::UnboundedSender<LiveEvent>,
+    share_state: &mut Option<(CancellationToken, Option<tokio::process::Child>)>,
+) {
+    let cmd = words[0].to_lowercase();
+    match cmd.as_str() {
+        "help" | "?" => {
+            app.set_info(vec![
+                "share commands:".into(),
+                "  run-tor                Start Tor daemon (ESC to cancel)".into(),
+                "  stop-tor               Stop Tor daemon".into(),
+                "  receiving-data         Start onion share listener (ESC to stop)".into(),
+                "  share-data             Interactive share wizard".into(),
+                "  contacts / servers     Switch screen".into(),
+            ]);
+        }
+        "run-tor" => {
+            if share_state.is_some() {
+                app.set_error("Share listener already running. Use stop-tor or close receiving-data first."); return;
+            }
+            let port: u16 = words.get(1).and_then(|s| s.parse().ok()).unwrap_or(17777);
+            let cancel = CancellationToken::new();
+            app.tor_status = TorStatus::Starting(0);
+            match crate::share::listen(port, store.clone(), event_tx.clone(), cancel.clone()).await {
+                Ok((_addr, tor_child)) => {
+                    *share_state = Some((cancel, tor_child));
+                }
+                Err(e) => {
+                    app.tor_status = TorStatus::Off;
+                    app.set_error(format!("Error: {e}"));
+                }
+            }
+        }
+        "stop-tor" => {
+            match share_state.take() {
+                Some((cancel, mut tor_child)) => {
+                    cancel.cancel();
+                    if let Some(ref mut child) = tor_child { let _ = child.kill().await; }
+                    app.tor_status = TorStatus::Off;
+                    app.receiving_locked = false;
+                }
+                None => app.set_error("No active Tor session"),
+            }
+        }
+        "receiving-data" => {
+            if share_state.is_some() {
+                app.set_error("Already listening. Use stop-tor first."); return;
+            }
+            let port: u16 = words.get(1).and_then(|s| s.parse().ok()).unwrap_or(17777);
+            let cancel = CancellationToken::new();
+            app.tor_status = TorStatus::Starting(0);
+            app.receiving_locked = true;
+            app.receiving_lines.clear();
+            match crate::share::listen(port, store.clone(), event_tx.clone(), cancel.clone()).await {
+                Ok((addr, tor_child)) => {
+                    *share_state = Some((cancel, tor_child));
+                    let addr_line = format!("Listening on {}", addr);
+                    app.receiving_lines.push_back(addr_line);
+                }
+                Err(e) => {
+                    app.tor_status = TorStatus::Off;
+                    app.receiving_locked = false;
+                    app.set_error(format!("Error: {e}"));
+                }
+            }
+        }
+        "share-data" => {
+            let contacts = store.list_contacts().unwrap_or_default();
+            if contacts.is_empty() {
+                app.set_error("No contacts to share with"); return;
+            }
+            app.overlay = Overlay::ShareData(ShareStep::SelectContact { contacts, cursor: 0 });
+        }
+        _ => app.set_error(format!("Unknown command: {}. Type 'help'.", words[0])),
+    }
+}
+
+// ── Share wizard confirmation ─────────────────────────────────────────────────
+
+async fn confirm_share_step(app: &mut App, store: &Store) {
+    let current = match &app.overlay {
+        Overlay::ShareData(step) => step,
+        _ => return,
+    };
+
+    match current {
+        ShareStep::SelectContact { contacts, cursor } => {
+            let contact = contacts[*cursor].clone();
+            let servers = store.list_servers().unwrap_or_default();
+            if servers.is_empty() {
+                app.overlay = Overlay::Error("No servers configured".into());
+                return;
+            }
+            app.overlay = Overlay::ShareData(ShareStep::SelectServer {
+                contact,
+                servers,
+                cursor: 0,
+            });
+        }
+        ShareStep::SelectServer { contact, servers, cursor } => {
+            let server = servers[*cursor].clone();
+            let contact = contact.clone();
+            let chats = store.list_chats_for_server(&server.id).unwrap_or_default();
+            if chats.is_empty() {
+                app.overlay = Overlay::Error("No chats on this server".into());
+                return;
+            }
+            app.overlay = Overlay::ShareData(ShareStep::SelectChat {
+                contact,
+                server,
+                chats,
+                cursor: 0,
+            });
+        }
+        ShareStep::SelectChat { contact, server, chats, cursor } => {
+            let chat = chats[*cursor].clone();
+            let contact = contact.clone();
+            let server = server.clone();
+            app.overlay = Overlay::None;
+
+            let identity = match store.load_identity() {
+                Ok(Some(id)) => id,
+                Ok(None) => { app.set_error("No identity found"); return; }
+                Err(e) => { app.set_error(format!("Error: {e}")); return; }
+            };
+
+            let contact_record = match store.load_contact(&contact.id) {
+                Ok(c) => c,
+                Err(e) => { app.set_error(format!("Error: {e}")); return; }
+            };
+
+            let data = ShareData::Chat(ChatShareData {
+                server_id: server.id.clone(),
+                chat_id: chat.chat_id.clone(),
+                name: chat.name.clone(),
+                encryption_key: chat.encryption_key_bytes.clone(),
+                server_admin_key: server.admin_key_bytes.clone(),
+            });
+
+            match crate::share::send_share(data, &contact_record, &identity, 17777).await {
+                Ok(()) => app.set_info(vec![format!(
+                    "Shared {}/{} with {}",
+                    server.id, chat.chat_id, contact.name
+                )]),
+                Err(e) => app.set_error(format!("Share error: {e}")),
+            }
+        }
+    }
+}
+
+fn overlay_cursor_up(app: &mut App) {
+    match &mut app.overlay {
+        Overlay::ShareData(ShareStep::SelectContact { cursor, .. }) => {
+            *cursor = cursor.saturating_sub(1);
+        }
+        Overlay::ShareData(ShareStep::SelectServer { cursor, .. }) => {
+            *cursor = cursor.saturating_sub(1);
+        }
+        Overlay::ShareData(ShareStep::SelectChat { cursor, .. }) => {
+            *cursor = cursor.saturating_sub(1);
+        }
+        _ => {}
+    }
+}
+
+fn overlay_cursor_down(app: &mut App) {
+    match &mut app.overlay {
+        Overlay::ShareData(ShareStep::SelectContact { contacts, cursor }) => {
+            *cursor = (*cursor + 1).min(contacts.len().saturating_sub(1));
+        }
+        Overlay::ShareData(ShareStep::SelectServer { servers, cursor, .. }) => {
+            *cursor = (*cursor + 1).min(servers.len().saturating_sub(1));
+        }
+        Overlay::ShareData(ShareStep::SelectChat { chats, cursor, .. }) => {
+            *cursor = (*cursor + 1).min(chats.len().saturating_sub(1));
+        }
+        _ => {}
+    }
+}
+
+fn overlay_back(app: &mut App, store: &Store) {
+    match &app.overlay {
+        Overlay::ShareData(ShareStep::SelectContact { .. }) => {
+            app.overlay = Overlay::None;
+        }
+        Overlay::ShareData(ShareStep::SelectServer { .. }) => {
+            let contacts = store.list_contacts().unwrap_or_default();
+            app.overlay = Overlay::ShareData(ShareStep::SelectContact { contacts, cursor: 0 });
+        }
+        Overlay::ShareData(ShareStep::SelectChat { contact, .. }) => {
+            let contact = contact.clone();
+            let servers = store.list_servers().unwrap_or_default();
+            app.overlay = Overlay::ShareData(ShareStep::SelectServer { contact, servers, cursor: 0 });
+        }
+        _ => app.overlay = Overlay::None,
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn fmt_ts(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms)
+        .map(|dt| dt.format("%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+fn new_aes_key_hex() -> String {
+    use m_core::crypto::algorithms::symmetric::Aes256Gcm;
+    use m_core::crypto::{CryptoKey, SymmetricCipher};
+    hex::encode(Aes256Gcm::new().get_key().as_bytes())
+}
+
+fn address_short(addr: &str) -> String {
+    use m_core::crypto::Hash;
+    use m_core::crypto::algorithms::hash::Blake3Hash;
+    let bytes = Blake3Hash::hash(addr.as_bytes(), 16).unwrap_or_default();
+    hex::encode(&bytes[..4])
+}
+
+// ── Public entry point ────────────────────────────────────────────────────────
+
+pub async fn run(store: Store) -> Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
@@ -799,88 +1073,123 @@ async fn run_inner(
     store: Store,
 ) -> Result<()> {
     let mut app = App::new();
-    app.push_left("m client TUI. Type 'help' for commands.".into());
+    refresh_contacts(&mut app, &store);
 
     let (live_event_tx, mut live_event_rx) = mpsc::unbounded_channel::<LiveEvent>();
     let mut manager = ConnectionManager::new(store.clone(), live_event_tx.clone());
     let mut share_state: Option<(CancellationToken, Option<tokio::process::Child>)> = None;
 
-    match manager.start_all_enabled() {
-        Ok(()) => {
-            let enabled = store.list_enabled_servers().unwrap_or_default();
-            if !enabled.is_empty() {
-                app.live_on = true;
-                let names: Vec<_> = enabled.iter().map(|s| s.name.clone()).collect();
-                app.push_left(format!("Auto-connected to: {}", names.join(", ")));
-            }
-        }
-        Err(e) => {
-            app.push_left(format!("Warning: auto-connect failed: {e}"));
-        }
-    }
+    let _ = manager.start_all_enabled();
 
     loop {
         draw(terminal, &app)?;
 
-        let has_terminal_event = event::poll(Duration::from_millis(16))?;
+        let has_event = event::poll(Duration::from_millis(16))?;
 
-        if has_terminal_event {
+        if has_event {
             match event::read()? {
                 Event::Key(key) => {
+                    // Ctrl+C always quits
                     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                        if let Some((c, mut tor_child)) = share_state.take() {
-                            c.cancel();
-                            if let Some(ref mut child) = tor_child {
-                                let _ = child.kill().await;
-                            }
-                        }
-                        manager.stop_all();
+                        cleanup_and_quit(&mut app, &mut manager, &mut share_state).await;
                         break;
                     }
-                    match key.code {
-                        KeyCode::Enter => {
-                            let input = app.input.clone();
-                            app.input.clear();
-                            app.cursor_pos = 0;
 
-                            if input.trim().is_empty() {
-                                continue;
+                    // ESC handling
+                    if key.code == KeyCode::Esc {
+                        match &app.overlay {
+                            Overlay::None => {
+                                // Exit live mode
+                                if matches!(app.live_mode, LiveMode::On { .. }) {
+                                    app.live_mode = LiveMode::Off;
+                                } else if app.receiving_locked || matches!(app.tor_status, TorStatus::Starting(_)) {
+                                    // Cancel run-tor / receiving-data
+                                    if let Some((cancel, mut tor_child)) = share_state.take() {
+                                        cancel.cancel();
+                                        if let Some(ref mut child) = tor_child { let _ = child.kill().await; }
+                                    }
+                                    app.tor_status = TorStatus::Off;
+                                    app.receiving_locked = false;
+                                }
                             }
-
-                            app.push_left(format!("> {input}"));
-
-                            match parse_command(&input) {
-                                CmdResult::Quit => {
-                                    if let Some((c, mut tor_child)) = share_state.take() {
-                                        c.cancel();
-                                        if let Some(ref mut child) = tor_child {
-                                            let _ = child.kill().await;
-                                        }
-                                    }
-                                    manager.stop_all();
-                                    break;
-                                }
-                                CmdResult::Clear => {
-                                    app.left_lines.clear();
-                                    app.left_scroll = 0;
-                                }
-                                CmdResult::Output => {
-                                    if !input.trim().is_empty() {
-                                        let lines = execute_command(
-                                            &input, &store, &mut manager,
-                                            &live_event_tx, &mut share_state,
-                                        ).await;
-                                        for line in lines {
-                                            app.push_left(line);
-                                        }
-                                        let has_enabled = store.list_enabled_servers()
-                                            .map(|s| !s.is_empty())
-                                            .unwrap_or(false);
-                                        app.live_on = has_enabled;
-                                    }
-                                }
+                            Overlay::Error(_) | Overlay::Info(_) => {
+                                app.overlay = Overlay::None;
+                            }
+                            Overlay::ShareData(_) => {
+                                overlay_back(&mut app, &store);
                             }
                         }
+                        continue;
+                    }
+
+                    // Arrow keys for list navigation and overlay navigation
+                    if key.code == KeyCode::Up {
+                        match &app.overlay {
+                            Overlay::ShareData(_) => overlay_cursor_up(&mut app),
+                            _ => cursor_up(&mut app),
+                        }
+                        continue;
+                    }
+                    if key.code == KeyCode::Down {
+                        match &app.overlay {
+                            Overlay::ShareData(_) => overlay_cursor_down(&mut app),
+                            _ => cursor_down(&mut app),
+                        }
+                        continue;
+                    }
+
+                    // Scroll live messages panel
+                    if let LiveMode::On { scroll, messages, .. } = &mut app.live_mode {
+                        if key.code == KeyCode::PageUp {
+                            *scroll = scroll.saturating_sub(5);
+                            continue;
+                        }
+                        if key.code == KeyCode::PageDown {
+                            *scroll = (*scroll + 5).min(messages.len().saturating_sub(1) as u16);
+                            continue;
+                        }
+                    }
+
+                    // Enter
+                    if key.code == KeyCode::Enter {
+                        match &app.overlay {
+                            Overlay::ShareData(_) => {
+                                confirm_share_step(&mut app, &store).await;
+                                continue;
+                            }
+                            Overlay::Error(_) | Overlay::Info(_) => {
+                                app.overlay = Overlay::None;
+                                continue;
+                            }
+                            Overlay::None => {}
+                        }
+
+                        if app.is_input_locked() { continue; }
+
+                        let input = app.input.clone();
+                        app.input.clear();
+                        app.cursor_pos = 0;
+
+                        if input.trim().is_empty() { continue; }
+
+                        let quit = execute_command(
+                            &input, &mut app, &store, &mut manager,
+                            &live_event_tx, &mut share_state,
+                        ).await;
+                        if quit {
+                            cleanup_and_quit(&mut app, &mut manager, &mut share_state).await;
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if app.is_input_locked() { continue; }
+                    if matches!(app.overlay, Overlay::Error(_) | Overlay::Info(_) | Overlay::ShareData(_)) {
+                        continue;
+                    }
+
+                    // Text editing
+                    match key.code {
                         KeyCode::Char(c) => {
                             app.input.insert(app.cursor_pos, c);
                             app.cursor_pos += 1;
@@ -897,28 +1206,22 @@ async fn run_inner(
                             }
                         }
                         KeyCode::Left => {
-                            if app.cursor_pos > 0 {
-                                app.cursor_pos -= 1;
-                            }
+                            if app.cursor_pos > 0 { app.cursor_pos -= 1; }
                         }
                         KeyCode::Right => {
-                            if app.cursor_pos < app.input.len() {
-                                app.cursor_pos += 1;
-                            }
+                            if app.cursor_pos < app.input.len() { app.cursor_pos += 1; }
                         }
-                        KeyCode::Home => {
-                            app.cursor_pos = 0;
-                        }
-                        KeyCode::End => {
-                            app.cursor_pos = app.input.len();
-                        }
+                        KeyCode::Home => { app.cursor_pos = 0; }
+                        KeyCode::End => { app.cursor_pos = app.input.len(); }
                         _ => {}
                     }
                 }
                 Event::Paste(text) => {
-                    for ch in text.chars() {
-                        app.input.insert(app.cursor_pos, ch);
-                        app.cursor_pos += 1;
+                    if !app.is_input_locked() {
+                        for ch in text.chars() {
+                            app.input.insert(app.cursor_pos, ch);
+                            app.cursor_pos += 1;
+                        }
                     }
                 }
                 Event::Resize(_, _) => {}
@@ -926,136 +1229,568 @@ async fn run_inner(
             }
         }
 
+        // Process live events
         while let Ok(event) = live_event_rx.try_recv() {
-            match event {
-                LiveEvent::Message(msg) => {
-                    app.push_right(format!(
-                        "[{}] [{}/{}] {}",
-                        msg.timestamp, msg.server_id, msg.chat_name, msg.text,
-                    ));
-                }
-                LiveEvent::SyncComplete { server_id, chat_name } => {
-                    app.push_right(format!("--- sync: {server_id}/{chat_name} ---"));
-                }
-                LiveEvent::Error { server_id, message } => {
-                    app.push_right(format!("! [{server_id}] {message}"));
-                }
-                LiveEvent::ServerUnavailable(sid) => {
-                    manager.handle_unavailable_server(&sid);
-                    app.push_right(format!("--- {sid}: unavailable ---"));
-                    let has_enabled = store.list_enabled_servers()
-                        .map(|s| !s.is_empty())
-                        .unwrap_or(false);
-                    app.live_on = has_enabled || !app.right_lines.is_empty();
-                }
-                LiveEvent::Disconnected(sid) => {
-                    manager.handle_disconnected(&sid);
-                    app.push_right(format!("--- {sid}: disconnected ---"));
-                }
-                LiveEvent::ShareReceived(data) => {
-                    let msg = match &data {
-                        ShareData::Server(s) => store.upsert_shared_server(s),
-                        ShareData::Chat(c) => store.upsert_shared_chat(c),
-                    };
-                    app.push_right(format!(
-                        "--- share: {} ---",
-                        msg.unwrap_or_else(|e| e.to_string()),
-                    ));
-                }
-                LiveEvent::TorBootstrap(pct) => {
-                    app.push_left(format!("  Tor bootstrap: {pct}%"));
-                }
-            }
+            handle_live_event(event, &mut app, &mut manager, &store);
         }
-
     }
 
     Ok(())
 }
 
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &App,
-) -> Result<()> {
+fn cursor_up(app: &mut App) {
+    match &app.screen {
+        Screen::Contacts => {
+            app.contacts_cursor = app.contacts_cursor.saturating_sub(1);
+        }
+        Screen::Servers => {
+            app.servers_cursor = app.servers_cursor.saturating_sub(1);
+        }
+        Screen::Chats { .. } => {
+            app.chats_cursor = app.chats_cursor.saturating_sub(1);
+        }
+        Screen::Share => {}
+    }
+}
+
+fn cursor_down(app: &mut App) {
+    match &app.screen {
+        Screen::Contacts => {
+            if !app.contacts.is_empty() {
+                app.contacts_cursor = (app.contacts_cursor + 1).min(app.contacts.len() - 1);
+            }
+        }
+        Screen::Servers => {
+            if !app.servers.is_empty() {
+                app.servers_cursor = (app.servers_cursor + 1).min(app.servers.len() - 1);
+            }
+        }
+        Screen::Chats { .. } => {
+            if !app.chats.is_empty() {
+                app.chats_cursor = (app.chats_cursor + 1).min(app.chats.len() - 1);
+            }
+        }
+        Screen::Share => {}
+    }
+}
+
+fn handle_live_event(event: LiveEvent, app: &mut App, manager: &mut ConnectionManager, store: &Store) {
+    match event {
+        LiveEvent::Message(msg) => {
+            if let LiveMode::On { server_id, chat_id, messages, scroll } = &mut app.live_mode {
+                if *server_id == msg.server_id && *chat_id == msg.chat_name {
+                    let line = format!("[{}] {}", msg.timestamp, msg.text);
+                    messages.push_back(line);
+                    if messages.len() > MAX_MESSAGES { messages.pop_front(); }
+                    // Auto-scroll to bottom
+                    *scroll = messages.len().saturating_sub(1) as u16;
+                }
+            }
+        }
+        LiveEvent::SyncComplete { .. } => {
+            refresh_chats(app, store);
+            refresh_servers(app, store);
+        }
+        LiveEvent::Error { server_id, message } => {
+            if let Screen::Chats { server_id: sid } = &app.screen {
+                if *sid == server_id {
+                    app.set_error(format!("[{server_id}] {message}"));
+                }
+            }
+        }
+        LiveEvent::ServerUnavailable(sid) => {
+            manager.handle_unavailable_server(&sid);
+            refresh_servers(app, store);
+        }
+        LiveEvent::Disconnected(sid) => {
+            manager.handle_disconnected(&sid);
+            refresh_servers(app, store);
+        }
+        LiveEvent::ShareReceived(data) => {
+            let result = match &data {
+                ShareData::Server(s) => store.upsert_shared_server(s),
+                ShareData::Chat(c) => store.upsert_shared_chat(c),
+            };
+            let line = match result {
+                Ok(msg) => format!("Received: {}", msg),
+                Err(e) => format!("Receive error: {e}"),
+            };
+            if app.receiving_lines.len() >= MAX_RECEIVING_LINES {
+                app.receiving_lines.pop_front();
+            }
+            app.receiving_lines.push_back(line);
+            refresh_servers(app, store);
+        }
+        LiveEvent::TorBootstrap(pct) => {
+            if pct >= 100 {
+                app.tor_status = TorStatus::Running;
+            } else {
+                app.tor_status = TorStatus::Starting(pct);
+            }
+        }
+    }
+}
+
+async fn cleanup_and_quit(
+    _app: &mut App,
+    manager: &mut ConnectionManager,
+    share_state: &mut Option<(CancellationToken, Option<tokio::process::Child>)>,
+) {
+    if let Some((cancel, mut tor_child)) = share_state.take() {
+        cancel.cancel();
+        if let Some(ref mut child) = tor_child { let _ = child.kill().await; }
+    }
+    manager.stop_all();
+}
+
+// ── Drawing ───────────────────────────────────────────────────────────────────
+
+fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> Result<()> {
     terminal.draw(|f| {
+        let full = f.area();
+
+        // Outer layout: main area + input bar
         let outer = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(3),
-                Constraint::Length(3),
-            ])
-            .split(f.area());
+            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .split(full);
 
-        let input_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(" Input ");
-        let input_text = Paragraph::new(Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Green)),
-            Span::raw(&app.input),
-        ]))
-        .block(input_block);
-        f.render_widget(input_text, outer[1]);
+        let main_area = outer[0];
+        let input_area = outer[1];
 
-        let cursor_x = outer[1].x + 1 + 2 + app.cursor_pos as u16;
-        let cursor_y = outer[1].y + 1;
-        f.set_cursor_position((cursor_x, cursor_y));
+        // Draw screen content
+        match &app.screen {
+            Screen::Contacts => draw_contacts(f, main_area, app),
+            Screen::Servers  => draw_servers(f, main_area, app),
+            Screen::Chats { .. } => draw_chats(f, main_area, app),
+            Screen::Share    => draw_share(f, main_area, app),
+        }
 
-        if app.live_on {
-            let top = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(50),
-                    Constraint::Percentage(50),
-                ])
-                .split(outer[0]);
+        // Draw input bar
+        draw_input(f, input_area, app);
 
-            let left_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::White))
-                .title(" Output ");
-            let left_lines: Vec<Line> = app.left_lines.iter()
-                .map(|s| Line::from(s.as_str()))
-                .collect();
-            let left_height = top[0].height.saturating_sub(2) as usize;
-            let left_scroll = app.left_lines.len().saturating_sub(left_height) as u16;
-            let left_para = Paragraph::new(left_lines)
-                .block(left_block)
-                .wrap(Wrap { trim: false })
-                .scroll((left_scroll, 0));
-            f.render_widget(left_para, top[0]);
-
-            let right_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(" Live ")
-                .title_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow));
-            let right_lines: Vec<Line> = app.right_lines.iter()
-                .map(|s| Line::from(s.as_str()))
-                .collect();
-            let right_height = top[1].height.saturating_sub(2) as usize;
-            let right_scroll = app.right_lines.len().saturating_sub(right_height) as u16;
-            let right_para = Paragraph::new(right_lines)
-                .block(right_block)
-                .wrap(Wrap { trim: false })
-                .scroll((right_scroll, 0));
-            f.render_widget(right_para, top[1]);
-        } else {
-            let left_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::White))
-                .title(" Output ");
-            let left_lines: Vec<Line> = app.left_lines.iter()
-                .map(|s| Line::from(s.as_str()))
-                .collect();
-            let left_height = outer[0].height.saturating_sub(2) as usize;
-            let left_scroll = app.left_lines.len().saturating_sub(left_height) as u16;
-            let left_para = Paragraph::new(left_lines)
-                .block(left_block)
-                .wrap(Wrap { trim: false })
-                .scroll((left_scroll, 0));
-            f.render_widget(left_para, outer[0]);
+        // Draw overlay last (on top)
+        if !matches!(app.overlay, Overlay::None) {
+            draw_overlay(f, full, app);
         }
     })?;
     Ok(())
+}
+
+fn item_style(is_cursor: bool) -> Style {
+    if is_cursor {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    }
+}
+
+fn item_border_style(is_cursor: bool) -> Style {
+    if is_cursor {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn draw_contacts(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Contacts ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.contacts.is_empty() {
+        let hint = Paragraph::new("No contacts. Use 'load <path> <name>' to import.")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(hint, inner);
+        return;
+    }
+
+    // Each contact gets a 3-line item block (border top + 1 line + border bottom)
+    let item_h = 3u16;
+    let visible = (inner.height / item_h) as usize;
+    let total = app.contacts.len();
+    let start = if app.contacts_cursor >= visible {
+        app.contacts_cursor - visible + 1
+    } else {
+        0
+    }.min(total.saturating_sub(visible));
+
+    let mut y = inner.y;
+    for (i, contact) in app.contacts.iter().enumerate().skip(start).take(visible) {
+        if y + item_h > inner.y + inner.height { break; }
+        let is_cur = i == app.contacts_cursor;
+        let item_area = Rect { x: inner.x, y, width: inner.width, height: item_h };
+        let b = Block::default()
+            .borders(Borders::ALL)
+            .border_style(item_border_style(is_cur));
+        let bi = b.inner(item_area);
+        f.render_widget(b, item_area);
+        let line = Line::from(vec![
+            Span::styled(format!("  {}", contact.name), item_style(is_cur)),
+            Span::styled(format!("  ID: {}", contact.id), Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(line), bi);
+        y += item_h;
+    }
+}
+
+fn draw_servers(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Servers ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.servers.is_empty() {
+        let hint = Paragraph::new("No servers. Use 'import <path>' or 'deploy <user> <ip> <pass>'.")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(hint, inner);
+        return;
+    }
+
+    let item_h = 3u16;
+    let visible = (inner.height / item_h) as usize;
+    let total = app.servers.len();
+    let start = if app.servers_cursor >= visible {
+        app.servers_cursor - visible + 1
+    } else {
+        0
+    }.min(total.saturating_sub(visible));
+
+    let mut y = inner.y;
+    for (i, server) in app.servers.iter().enumerate().skip(start).take(visible) {
+        if y + item_h > inner.y + inner.height { break; }
+        let is_cur = i == app.servers_cursor;
+        let item_area = Rect { x: inner.x, y, width: inner.width, height: item_h };
+        let b = Block::default()
+            .borders(Borders::ALL)
+            .border_style(item_border_style(is_cur));
+        let bi = b.inner(item_area);
+        f.render_widget(b, item_area);
+
+        let state_color = match server.state {
+            NodeState::Enabled => Color::Green,
+            NodeState::Disabled => Color::DarkGray,
+            NodeState::Unavailable => Color::Red,
+        };
+        let last_ts = app.servers_last_ts.get(i).and_then(|t| *t);
+        let ts_span = match last_ts {
+            Some(ts) => Span::styled(format!("  {}", fmt_ts(ts)), Style::default().fg(Color::DarkGray)),
+            None => Span::raw(""),
+        };
+        let line = Line::from(vec![
+            Span::styled(format!("  {}", server.name), item_style(is_cur)),
+            Span::styled(format!("  ID: {}", server.id), Style::default().fg(Color::DarkGray)),
+            ts_span,
+            Span::styled(format!("  [{}]", server.state), Style::default().fg(state_color)),
+        ]);
+        f.render_widget(Paragraph::new(line), bi);
+        y += item_h;
+    }
+}
+
+fn draw_chats(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let server_id = if let Screen::Chats { server_id } = &app.screen {
+        server_id.as_str()
+    } else {
+        ""
+    };
+
+    // Split: left ~30% for chat list, right ~70% for live messages
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(area);
+
+    // Left: chat list
+    let left_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" {} ", server_id));
+    let left_inner = left_block.inner(cols[0]);
+    f.render_widget(left_block, cols[0]);
+
+    if app.chats.is_empty() {
+        let hint = Paragraph::new("No chats.\n'import <path>'")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(hint, left_inner);
+    } else {
+        let item_h = 3u16;
+        let visible = (left_inner.height / item_h) as usize;
+        let total = app.chats.len();
+        let start = if app.chats_cursor >= visible {
+            app.chats_cursor - visible + 1
+        } else {
+            0
+        }.min(total.saturating_sub(visible));
+
+        let mut y = left_inner.y;
+        for (i, chat) in app.chats.iter().enumerate().skip(start).take(visible) {
+            if y + item_h > left_inner.y + left_inner.height { break; }
+            let is_cur = i == app.chats_cursor;
+
+            // Highlight active live chat
+            let is_live = match &app.live_mode {
+                LiveMode::On { chat_id, .. } => chat_id == &chat.chat_id,
+                _ => false,
+            };
+
+            let item_area = Rect { x: left_inner.x, y, width: left_inner.width, height: item_h };
+            let b = Block::default()
+                .borders(Borders::ALL)
+                .border_style(if is_live {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    item_border_style(is_cur)
+                });
+            let bi = b.inner(item_area);
+            f.render_widget(b, item_area);
+
+            let state_color = match chat.state {
+                NodeState::Enabled => Color::Green,
+                NodeState::Disabled => Color::DarkGray,
+                NodeState::Unavailable => Color::Red,
+            };
+            let text_style = if is_cur {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let ts_span = if chat.state == NodeState::Enabled && chat.last_synced_ts > 0 {
+                Span::styled(format!(" {}", fmt_ts(chat.last_synced_ts)), Style::default().fg(Color::DarkGray))
+            } else {
+                Span::raw("")
+            };
+            let line = Line::from(vec![
+                Span::styled(format!(" {}", chat.name), text_style),
+                ts_span,
+                Span::styled(format!(" [{}]", chat.state), Style::default().fg(state_color)),
+            ]);
+            f.render_widget(Paragraph::new(line), bi);
+            y += item_h;
+        }
+    }
+
+    // Right: live messages or hint
+    match &app.live_mode {
+        LiveMode::On { chat_id, messages, scroll, .. } => {
+            let right_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(format!(" {} — live ", chat_id))
+                .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+            let right_inner = right_block.inner(cols[1]);
+            f.render_widget(right_block, cols[1]);
+
+            let lines: Vec<Line> = messages.iter().map(|s| Line::from(s.as_str())).collect();
+            let height = right_inner.height as usize;
+            let auto_scroll = messages.len().saturating_sub(height) as u16;
+            let actual_scroll = (*scroll).max(auto_scroll.saturating_sub(0));
+            let para = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((actual_scroll, 0));
+            f.render_widget(para, right_inner);
+        }
+        LiveMode::Off => {
+            let right_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" messages ");
+            let right_inner = right_block.inner(cols[1]);
+            f.render_widget(right_block, cols[1]);
+            let hint = Paragraph::new("Use 'live' to enter live mode for selected chat.")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            // Center vertically
+            let y_offset = right_inner.height / 2;
+            let hint_area = Rect { y: right_inner.y + y_offset, ..right_inner };
+            f.render_widget(hint, hint_area);
+        }
+    }
+}
+
+fn draw_share(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Share / Tor ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let tor_line = match &app.tor_status {
+        TorStatus::Off => Line::from(vec![
+            Span::raw("Tor: "),
+            Span::styled("off", Style::default().fg(Color::DarkGray)),
+        ]),
+        TorStatus::Starting(pct) => Line::from(vec![
+            Span::raw("Tor: "),
+            Span::styled(format!("starting {}%", pct), Style::default().fg(Color::Yellow)),
+            Span::styled(" (ESC to cancel)", Style::default().fg(Color::DarkGray)),
+        ]),
+        TorStatus::Running => Line::from(vec![
+            Span::raw("Tor: "),
+            Span::styled("running", Style::default().fg(Color::Green)),
+        ]),
+    };
+
+    let recv_indicator = if app.receiving_locked {
+        Line::from(vec![
+            Span::styled("Receiving data... ", Style::default().fg(Color::Yellow)),
+            Span::styled("(ESC to stop)", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from("")
+    };
+
+    let mut all_lines: Vec<Line> = vec![tor_line, recv_indicator, Line::from("")];
+
+    for line in &app.receiving_lines {
+        all_lines.push(Line::from(line.as_str()));
+    }
+
+    let height = inner.height as usize;
+    let scroll = all_lines.len().saturating_sub(height) as u16;
+    let para = Paragraph::new(all_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    f.render_widget(para, inner);
+}
+
+fn draw_input(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let prompt = app.input_prompt();
+
+    let (border_style, content) = if app.is_input_locked() {
+        (
+            Style::default().fg(Color::DarkGray),
+            Line::from(vec![
+                Span::styled(format!(" {}> ", prompt), Style::default().fg(Color::DarkGray)),
+                Span::styled("[locked — ESC to stop]", Style::default().fg(Color::Red)),
+            ]),
+        )
+    } else {
+        (
+            Style::default().fg(Color::Cyan),
+            Line::from(vec![
+                Span::styled(format!(" {}> ", prompt), Style::default().fg(Color::Green)),
+                Span::raw(&app.input),
+            ]),
+        )
+    };
+
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = input_block.inner(area);
+    f.render_widget(input_block, area);
+    f.render_widget(Paragraph::new(content), inner);
+
+    if !app.is_input_locked() {
+        let prompt_len = (prompt.len() + 3) as u16; // " > " prefix
+        let cursor_x = inner.x + prompt_len + app.cursor_pos as u16;
+        let cursor_y = inner.y;
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+fn draw_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    match &app.overlay {
+        Overlay::None => {}
+        Overlay::Error(msg) => {
+            let lines: Vec<Line> = std::iter::once(Line::from(vec![
+                Span::styled("Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::raw(msg.as_str()),
+            ]))
+            .chain(std::iter::once(Line::from(
+                Span::styled("  [ESC or Enter to close]", Style::default().fg(Color::DarkGray))
+            )))
+            .collect();
+            render_overlay_box(f, area, " Error ", &lines, Color::Red);
+        }
+        Overlay::Info(lines) => {
+            let ls: Vec<Line> = lines.iter()
+                .map(|s| Line::from(s.as_str()))
+                .chain(std::iter::once(Line::from(
+                    Span::styled("  [ESC or Enter to close]", Style::default().fg(Color::DarkGray))
+                )))
+                .collect();
+            render_overlay_box(f, area, " Info ", &ls, Color::Cyan);
+        }
+        Overlay::ShareData(step) => {
+            draw_share_wizard(f, area, step);
+        }
+    }
+}
+
+fn render_overlay_box(f: &mut ratatui::Frame, area: Rect, title: &str, lines: &[Line], color: Color) {
+    let max_w = area.width.saturating_sub(8).min(80);
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(max_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: max_w, height: h };
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(title);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let para = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+}
+
+fn draw_share_wizard(f: &mut ratatui::Frame, area: Rect, step: &ShareStep) {
+    let (title, items, cursor, hint): (&str, Vec<String>, usize, &str) = match step {
+        ShareStep::SelectContact { contacts, cursor } => (
+            " Share — Select Contact ",
+            contacts.iter().map(|c| format!("  {} ({})", c.name, c.id)).collect(),
+            *cursor,
+            "↑/↓ navigate  Enter select  ESC cancel",
+        ),
+        ShareStep::SelectServer { servers, cursor, .. } => (
+            " Share — Select Server ",
+            servers.iter().map(|s| format!("  {} [{}]", s.name, s.state)).collect(),
+            *cursor,
+            "↑/↓ navigate  Enter select  ESC back",
+        ),
+        ShareStep::SelectChat { chats, cursor, .. } => (
+            " Share — Select Chat ",
+            chats.iter().map(|c| format!("  {} [{}]", c.name, c.state)).collect(),
+            *cursor,
+            "↑/↓ navigate  Enter confirm  ESC back",
+        ),
+    };
+
+    let max_w = area.width.saturating_sub(8).min(70);
+    let h = ((items.len() + 4) as u16).min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(max_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: max_w, height: h };
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(title);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = items.iter().enumerate().map(|(i, item)| {
+        if i == cursor {
+            Line::from(Span::styled(item.as_str(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+        } else {
+            Line::from(item.as_str())
+        }
+    }).collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))));
+
+    let visible_h = inner.height as usize;
+    let scroll = if cursor >= visible_h { (cursor - visible_h + 1) as u16 } else { 0 };
+    let para = Paragraph::new(lines).scroll((scroll, 0));
+    f.render_widget(para, inner);
 }

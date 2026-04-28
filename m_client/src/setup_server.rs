@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 use tokio::process::Command;
-use tokio::process::Stdio;
+use std::process::Stdio;
 
 const BIN_DIR: &str = "/usr/bin";
 const CONFIG_DIR: &str = "/etc/m_server";
@@ -14,7 +14,6 @@ const CONFIG_PATH: &str = "/etc/m_server/m_server.toml";
 
 const CONFIG_TEMPLATE_PATH: &str = "/etc/m_server/m_server.template.toml";
 
-const KEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 pub struct SshCredentials {
     username: String,

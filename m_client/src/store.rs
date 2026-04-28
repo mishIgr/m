@@ -9,7 +9,7 @@ use m_core::db::{RedbStore, KvStore, Table};
 
 use crate::identity::ContactCard;
 use crate::sharing::{ServerShareData, ChatShareData};
-use crate::config::{ServerImport, ChatImport};
+use crate::config::{ServerCard, ChatCard};
 
 const SERVER_TABLE: &str = "servers";
 const CHATS_TABLE: &str = "chats";
@@ -98,35 +98,35 @@ impl Store {
         Ok(Self { db })
     }
 
-    pub fn save_server(&self, import: &ServerImport) -> Result<()> {
-        let shared_key_bytes = hex::decode(&import.auth.shared_key)
-            .context("Failed to decode shared_key hex")?;
-        let admin_key_bytes = import.auth.admin_key.as_ref()
-            .map(|k| hex::decode(k))
-            .transpose()
-            .context("Failed to decode admin_key hex")?;
-
-        let id = import.connection.id.clone();
-        let name = format!("{}-{}", id, address_hash(&import.connection.server_address));
-
+    pub fn save_server_card(&self, card: &ServerCard) -> Result<()> {
+        let name = format!("{}-{}", card.id, address_hash(&card.address));
         let record = ServerRecord {
-            id: id.clone(),
+            id: card.id.clone(),
             name,
-            address: import.connection.server_address.clone(),
-            shared_key_bytes,
-            admin_key_bytes,
+            address: card.address.clone(),
+            shared_key_bytes: card.shared_key.clone(),
+            admin_key_bytes: card.admin_key.clone(),
             state: NodeState::Disabled,
         };
-
         let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
-        table.put(&id, &record)?;
+        table.put(&card.id, &record)?;
         Ok(())
+    }
+
+    pub fn export_server_card(&self, id: &str) -> Result<ServerCard> {
+        let r = self.load_server(id)?;
+        Ok(ServerCard {
+            id: r.id,
+            address: r.address,
+            shared_key: r.shared_key_bytes,
+            admin_key: r.admin_key_bytes,
+        })
     }
 
     pub fn load_server(&self, id: &str) -> Result<ServerRecord> {
         let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
         table.get(&id.to_string())?
-            .ok_or_else(|| anyhow::anyhow!("Server '{}' not found. Run: import-server <path.toml>", id))
+            .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", id))
     }
 
     pub fn list_servers(&self) -> Result<Vec<ServerRecord>> {
@@ -148,24 +148,43 @@ impl Store {
         Ok(())
     }
 
-    pub fn save_chat(&self, import: &ChatImport) -> Result<()> {
-        let encryption_key_bytes = hex::decode(&import.encryption_key)
-            .context("Failed to decode encryption_key hex")?;
+    pub fn rename_server(&self, id: &str, name: &str) -> Result<()> {
+        let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
+        let mut record = self.load_server(id)?;
+        record.name = name.to_string();
+        table.put(&id.to_string(), &record)?;
+        Ok(())
+    }
 
-        let key = format!("{}:{}", import.server_id, import.chat_id);
+    pub fn delete_server(&self, id: &str) -> Result<()> {
+        let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
+        table.delete(&id.to_string())?;
+        Ok(())
+    }
 
+    pub fn save_chat_card(&self, card: &ChatCard) -> Result<()> {
+        let key = format!("{}:{}", card.server_id, card.chat_id);
         let record = ChatRecord {
-            server_id: import.server_id.clone(),
-            chat_id: import.chat_id.clone(),
-            name: import.name.clone(),
-            encryption_key_bytes,
+            server_id: card.server_id.clone(),
+            chat_id: card.chat_id.clone(),
+            name: card.name.clone(),
+            encryption_key_bytes: card.encryption_key.clone(),
             last_synced_ts: 0,
             state: NodeState::Disabled,
         };
-
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         table.put(&key, &record)?;
         Ok(())
+    }
+
+    pub fn export_chat_card(&self, server_id: &str, chat_id: &str) -> Result<ChatCard> {
+        let r = self.load_chat(server_id, chat_id)?;
+        Ok(ChatCard {
+            server_id: r.server_id,
+            chat_id: r.chat_id,
+            name: r.name,
+            encryption_key: r.encryption_key_bytes,
+        })
     }
 
     pub fn load_chat(&self, server_id: &str, chat_id: &str) -> Result<ChatRecord> {
@@ -173,7 +192,7 @@ impl Store {
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         table.get(&key)?
             .ok_or_else(|| anyhow::anyhow!(
-                "Chat '{chat_id}' not found on server '{server_id}'. Run: import-chat <path.toml>"
+                "Chat '{chat_id}' not found on server '{server_id}'"
             ))
     }
 
@@ -197,6 +216,22 @@ impl Store {
         let mut record = self.load_chat(server_id, chat_id)?;
         record.state = state;
         table.put(&key, &record)?;
+        Ok(())
+    }
+
+    pub fn rename_chat(&self, server_id: &str, chat_id: &str, name: &str) -> Result<()> {
+        let key = format!("{server_id}:{chat_id}");
+        let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
+        let mut record = self.load_chat(server_id, chat_id)?;
+        record.name = name.to_string();
+        table.put(&key, &record)?;
+        Ok(())
+    }
+
+    pub fn delete_chat(&self, server_id: &str, chat_id: &str) -> Result<()> {
+        let key = format!("{server_id}:{chat_id}");
+        let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
+        table.delete(&key)?;
         Ok(())
     }
 

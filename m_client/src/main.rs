@@ -6,6 +6,7 @@ mod live;
 mod sharing;
 mod identity;
 mod share;
+mod setup_server;
 mod tui;
 
 use std::path::PathBuf;
@@ -60,5 +61,5 @@ async fn main() -> Result<()> {
         panic!("Error init logger, error: {}", err);
     }
 
-    tui::run(config, store).await
+    tui::run(store).await
 }
