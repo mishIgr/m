@@ -119,6 +119,9 @@ impl App {
     }
 
     fn input_prompt(&self) -> &'static str {
+        if matches!(self.live_mode, LiveMode::On { .. }) {
+            return "message";
+        }
         match &self.screen {
             Screen::Contacts => "contacts",
             Screen::Servers => "servers",
@@ -1172,6 +1175,27 @@ async fn run_inner(
 
                         if input.trim().is_empty() { continue; }
 
+                        // In live mode send message directly, no commands
+                        if let LiveMode::On { server_id, chat_id, .. } = &app.live_mode {
+                            let sid = server_id.clone();
+                            let cid = chat_id.clone();
+                            match store.load_server(&sid) {
+                                Ok(server) => match store.load_chat(&sid, &cid) {
+                                    Ok(chat) => match Transport::connect(&server.address, &server.shared_key_bytes).await {
+                                        Ok(mut t) => match t.send_message(&cid, &input, &chat.encryption_key_bytes).await {
+                                            Ok(r) if r.accepted => {}
+                                            Ok(r) => app.set_error(format!("Rejected: {}", r.error)),
+                                            Err(e) => app.set_error(format!("Send error: {e}")),
+                                        },
+                                        Err(e) => app.set_error(format!("Connection error: {e}")),
+                                    },
+                                    Err(e) => app.set_error(format!("Error loading chat: {e}")),
+                                },
+                                Err(e) => app.set_error(format!("Error loading server: {e}")),
+                            }
+                            continue;
+                        }
+
                         let quit = execute_command(
                             &input, &mut app, &store, &mut manager,
                             &live_event_tx, &mut share_state,
@@ -1677,6 +1701,14 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, app: &App) {
             Line::from(vec![
                 Span::styled(format!(" {}> ", prompt), Style::default().fg(Color::DarkGray)),
                 Span::styled("[locked — ESC to stop]", Style::default().fg(Color::Red)),
+            ]),
+        )
+    } else if matches!(app.live_mode, LiveMode::On { .. }) {
+        (
+            Style::default().fg(Color::Yellow),
+            Line::from(vec![
+                Span::styled(format!(" {}> ", prompt), Style::default().fg(Color::Yellow)),
+                Span::raw(&app.input),
             ]),
         )
     } else {
