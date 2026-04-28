@@ -2,4 +2,6 @@
 db_path = "~/.local/share/m/client.redb"
 
 [logging]
-path = "~/.local/share/m/client-logs/"
+log_dir = "~/.local/share/m/client-logs/"
+max_files = 5
+max_file_size = 10485760

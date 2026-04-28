@@ -5,10 +5,9 @@ bind_address = "0.0.0.0:50051"
 path = "~/.local/share/m/server.redb"
 
 [logging]
-path = "~/.local/share/m/server-logs/"
+log_dir = "~/.local/share/m/server-logs/"
 max_files = 5
-max_file_size_mb = 10
-basename = "m_server"
+max_file_size = 10485760
 
 [delivery]
 ack_timeout_secs = 10
