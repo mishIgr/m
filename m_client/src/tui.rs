@@ -1192,12 +1192,14 @@ async fn run_inner(
                     match key.code {
                         KeyCode::Char(c) => {
                             app.input.insert(app.cursor_pos, c);
-                            app.cursor_pos += 1;
+                            app.cursor_pos += c.len_utf8();
                         }
                         KeyCode::Backspace => {
                             if app.cursor_pos > 0 {
-                                app.cursor_pos -= 1;
-                                app.input.remove(app.cursor_pos);
+                                let prev = app.input[..app.cursor_pos]
+                                    .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                                app.input.remove(prev);
+                                app.cursor_pos = prev;
                             }
                         }
                         KeyCode::Delete => {
@@ -1206,10 +1208,16 @@ async fn run_inner(
                             }
                         }
                         KeyCode::Left => {
-                            if app.cursor_pos > 0 { app.cursor_pos -= 1; }
+                            if app.cursor_pos > 0 {
+                                app.cursor_pos = app.input[..app.cursor_pos]
+                                    .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                            }
                         }
                         KeyCode::Right => {
-                            if app.cursor_pos < app.input.len() { app.cursor_pos += 1; }
+                            if app.cursor_pos < app.input.len() {
+                                let c = app.input[app.cursor_pos..].chars().next().unwrap();
+                                app.cursor_pos += c.len_utf8();
+                            }
                         }
                         KeyCode::Home => { app.cursor_pos = 0; }
                         KeyCode::End => { app.cursor_pos = app.input.len(); }
@@ -1220,7 +1228,7 @@ async fn run_inner(
                     if !app.is_input_locked() {
                         for ch in text.chars() {
                             app.input.insert(app.cursor_pos, ch);
-                            app.cursor_pos += 1;
+                            app.cursor_pos += ch.len_utf8();
                         }
                     }
                 }
@@ -1690,7 +1698,7 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
     if !app.is_input_locked() {
         let prompt_len = (prompt.len() + 3) as u16; // " > " prefix
-        let cursor_x = inner.x + prompt_len + app.cursor_pos as u16;
+        let cursor_x = inner.x + prompt_len + app.input[..app.cursor_pos].chars().count() as u16;
         let cursor_y = inner.y;
         f.set_cursor_position((cursor_x, cursor_y));
     }
