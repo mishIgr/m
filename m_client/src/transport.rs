@@ -66,11 +66,16 @@ pub fn decrypt_payload(encrypted: &[u8], key_bytes: &[u8], chat_id: &str) -> Res
 
 impl Transport {
     pub async fn connect(address: &str, shared_key_bytes: &[u8]) -> Result<Self> {
+        m_core::log_info!("transport: connecting to {}", address);
         let key: Key<32> = CryptoKey::from_bytes(shared_key_bytes)
             .map_err(|e| anyhow::anyhow!("bad shared key: {e}"))?;
         let cipher = Aes256Gcm::from_key(key);
         let client = MessengerClient::connect(address.to_string()).await
-            .context("failed to connect to server")?;
+            .map_err(|e| {
+                m_core::log_error!("transport: failed to connect to {}: {}", address, e);
+                anyhow::anyhow!("failed to connect to server: {e}")
+            })?;
+        m_core::log_info!("transport: connected to {}", address);
         Ok(Self { client, cipher })
     }
 
@@ -92,8 +97,12 @@ impl Transport {
             max_bytes,
         };
         let envelope = encrypt_envelope(&self.cipher, &req)?;
+        m_core::log_info!("transport: create_chat rpc chat_id={}", chat_id);
         let resp = self.client.create_chat(Request::new(envelope)).await
-            .context("create_chat RPC failed")?;
+            .map_err(|e| {
+                m_core::log_error!("transport: create_chat rpc failed: {}", e);
+                anyhow::anyhow!("create_chat RPC failed: {e}")
+            })?;
         decrypt_envelope(&self.cipher, &resp.into_inner())
     }
 

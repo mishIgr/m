@@ -117,14 +117,19 @@ where
         &self,
         request: Request<Envelope>,
     ) -> Result<Response<Envelope>, Status> {
-        let req: CreateChatRequest = self.decrypt_request(request)?;
-        self.verify_admin(&req.admin_key)?;
+        m_core::log_info!("service: create_chat request received");
+        let req: CreateChatRequest = self.decrypt_request(request)
+            .map_err(|e| { m_core::log_error!("service: create_chat decrypt failed: {}", e); e })?;
+        self.verify_admin(&req.admin_key)
+            .map_err(|e| { m_core::log_error!("service: create_chat admin key invalid"); e })?;
 
+        m_core::log_info!("service: create_chat chat_id={}", req.chat_id);
         let mut d = self.dispatcher.lock().await;
         let success = d
             .create_chat(&req.chat_id, req.max_messages, req.max_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| { m_core::log_error!("service: create_chat dispatcher error: {}", e); Status::internal(e.to_string()) })?;
 
+        m_core::log_info!("service: create_chat success={} chat_id={}", success, req.chat_id);
         self.encrypt_response(&CreateChatResponse {
             success,
             error: if success { String::new() } else { "chat already exists".into() },
@@ -234,6 +239,7 @@ where
             let mut d = dispatcher.lock().await;
             d.register_connection(inner_tx)
         };
+        m_core::log_info!("service: channel opened conn_id={}", conn_id);
 
         let fwd_cipher = cipher.clone();
         let fwd_tx = outer_tx.clone();
@@ -304,6 +310,7 @@ where
 
             let mut d = dispatcher.lock().await;
             d.remove_connection(conn_id);
+            m_core::log_info!("service: channel closed conn_id={}", conn_id);
         });
 
         Ok(Response::new(ReceiverStream::new(outer_rx)))
