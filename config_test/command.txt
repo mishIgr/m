@@ -1,0 +1,11 @@
+target/debug/m_client --config config_test/client1.toml seed-server \
+  --id my-server \
+  --address "127.0.0.1:50051" \
+  --user-key "1a2b3c4d5e6f1234567890abcdef12341a2b3c4d5e6f1234567890abcdef1234" \
+  --admin-key "1a2b3c4d5e6f1234567890abcdef12351a2b3c4d5e6f1234567890abcdef1235"
+
+target/debug/m_client --config config_test/client2.toml seed-server \
+  --id my-server \
+  --address "127.0.0.1:50051" \
+  --user-key "1a2b3c4d5e6f1234567890abcdef12341a2b3c4d5e6f1234567890abcdef1234" \
+  --admin-key "1a2b3c4d5e6f1234567890abcdef12351a2b3c4d5e6f1234567890abcdef1235"

@@ -186,21 +186,6 @@ impl Logger {
 
 static M_LOGGER: Mutex<Option<Logger>> = Mutex::new(None);
 
-pub fn init_logger(config: LoggerConfig) -> io::Result<()> {
-    let logger = Logger::new(config)?;
-    let mut global = M_LOGGER.lock().unwrap();
-    *global = Some(logger);
-    Ok(())
-}
-
-pub fn reconfigure_logger(config: LoggerConfig) -> io::Result<()> {
-    // сначала создаём новый логгер — только потом берём мьютекс
-    let logger = Logger::new(config)?;
-    let mut global = M_LOGGER.lock().unwrap();
-    *global = Some(logger);
-    Ok(())
-}
-
 pub fn with_logger<F>(f: F)
 where
     F: FnOnce(&Logger),
@@ -250,4 +235,21 @@ macro_rules! log_error {
             logger.error(&format!($($arg)*));
         });
     };
+}
+
+pub fn init_logger(config: LoggerConfig) -> io::Result<()> {
+    let logger = Logger::new(config)?;
+    let mut global = M_LOGGER.lock().unwrap();
+    *global = Some(logger);
+    log_info!("init logger");
+    Ok(())
+}
+
+pub fn reconfigure_logger(config: LoggerConfig) -> io::Result<()> {
+    // сначала создаём новый логгер — только потом берём мьютекс
+    let logger = Logger::new(config)?;
+    let mut global = M_LOGGER.lock().unwrap();
+    *global = Some(logger);
+    log_info!("reconfigure logger");
+    Ok(())
 }
