@@ -180,7 +180,7 @@ In **contacts** and **servers** windows use ↑/↓ arrows to move the cursor th
 | `export <path>` | Export selected server to a binary card file |
 | `deploy <user> <ip> <pass>` | Deploy server via SSH (auto-generates keys) |
 | `remove <user> <ip> <pass>` | Remove server via SSH and delete locally |
-| `admin create-chat <id>` | Create a chat on the selected server |
+| `admin create-chat <id>` | Create chat on server, generate encryption key, save locally |
 | `admin delete-chat <id>` | Delete a chat from the selected server |
 | `admin list-chats` | List all chats on the selected server |
 
@@ -235,20 +235,28 @@ Server 'remote' imported
 
 ### 2. Create a chat (admin)
 
+Requires an admin key on the server. Generates a fresh AES-256-GCM encryption key, creates the chat on the server, then saves the chat locally. If either step fails nothing is written anywhere.
+
 ```
 servers> admin create-chat general
 Chat 'general' created
+Key: <64-char hex>
 ```
 
-### 3. Add a chat
+The chat is saved locally in the `Disabled` state. Enable it and share the chat card with other users.
+
+### 3. Enable and use the chat
 
 ```
 servers> chats
-servers/chats> import ~/chat.card
-Chat 'remote/general' imported
-
 servers/chats> enable
 servers/chats> live
+```
+
+Other users can receive the chat via `share-data` / `receiving-data` or by importing an exported card:
+
+```
+servers/chats> export ~/general.card      # share out-of-band
 ```
 
 ### 4. Send a message

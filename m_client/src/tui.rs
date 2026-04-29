@@ -387,7 +387,7 @@ async fn exec_servers(
                 "  export <path>          Export selected server to binary file".into(),
                 "  deploy <user> <ip> <pass>  Deploy server via SSH".into(),
                 "  remove <user> <ip> <pass>  Remove server via SSH".into(),
-                "  admin create-chat <id> Create chat on selected server".into(),
+                "  admin create-chat <id> Create chat on server, generate key, save locally".into(),
                 "  admin delete-chat <id> Delete chat on selected server".into(),
                 "  admin list-chats       List chats on selected server".into(),
                 "  contacts / share       Switch screen".into(),
