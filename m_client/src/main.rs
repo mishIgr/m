@@ -19,11 +19,40 @@ use identity::Identity;
 use config::ClientConfig;
 use store::{Store, IdentityRecord};
 
+#[cfg(debug_assertions)]
+use clap::Subcommand;
+#[cfg(debug_assertions)]
+use config::ServerCard;
+#[cfg(debug_assertions)]
+use anyhow::Context;
+
 #[derive(Parser)]
 #[command(name = "m_client", about = "Encrypted messenger TUI client")]
 struct Cli {
     #[arg(long, default_value = "~/.config/m/client.toml")]
     config: String,
+
+    #[cfg(debug_assertions)]
+    #[command(subcommand)]
+    command: Option<DevCmd>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Subcommand)]
+enum DevCmd {
+    /// Write a fake server record into the client DB (no server needed)
+    SeedServer {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        address: String,
+        /// Hex-encoded shared/user key (from server config encryption.user_key)
+        #[arg(long)]
+        user_key: String,
+        /// Hex-encoded admin key (from server config encryption.admin_key)
+        #[arg(long)]
+        admin_key: Option<String>,
+    },
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -55,6 +84,19 @@ async fn main() -> Result<()> {
         println!("Identity generated.");
         println!("  ID:    {}", record.id);
         println!("  Onion: {}", identity.onion_address());
+    }
+
+    #[cfg(debug_assertions)]
+    if let Some(DevCmd::SeedServer { id, address, user_key, admin_key }) = cli.command {
+        let shared_key = hex::decode(&user_key)
+            .with_context(|| "Invalid hex in --user-key")?;
+        let admin_key = admin_key
+            .map(|k| hex::decode(&k).with_context(|| "Invalid hex in --admin-key"))
+            .transpose()?;
+        let card = ServerCard { id, address, shared_key, admin_key };
+        store.save_server_card(&card)?;
+        println!("Server '{}' seeded into DB.", card.id);
+        return Ok(());
     }
 
     if let Err(err) = m_core::init_logger(config.logging) {
