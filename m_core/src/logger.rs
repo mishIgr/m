@@ -243,7 +243,7 @@ pub fn init_logger(config: LoggerConfig) -> io::Result<()> {
         let mut global = M_LOGGER.lock().unwrap();
         *global = Some(logger);
     }
-    log_info!("init logger");
+    log_debug!("init logger");
     Ok(())
 }
 
@@ -253,6 +253,6 @@ pub fn reconfigure_logger(config: LoggerConfig) -> io::Result<()> {
         let mut global = M_LOGGER.lock().unwrap();
         *global = Some(logger);
     }
-    log_info!("reconfigure logger");
+    log_debug!("reconfigure logger");
     Ok(())
 }
