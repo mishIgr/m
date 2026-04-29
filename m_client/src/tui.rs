@@ -570,9 +570,27 @@ async fn exec_servers(
                         Some(s) if !s.is_empty() => *s,
                         _ => { app.set_error("Usage: admin create-chat <chat_id>"); return; }
                     };
+                    let encryption_key = new_aes_key_bytes();
                     match transport.create_chat(&admin_key, id, 1000, 10_485_760).await {
-                        Ok(r) if r.success => app.set_info(vec![format!("Chat '{}' created", id)]),
-                        Ok(r) => app.set_error(format!("Failed: {}", r.error)),
+                        Ok(r) if r.success => {
+                            let card = crate::config::ChatCard {
+                                server_id: server.id.clone(),
+                                chat_id: id.to_string(),
+                                name: id.to_string(),
+                                encryption_key: encryption_key.clone(),
+                            };
+                            match store.save_chat_card(&card) {
+                                Ok(()) => {
+                                    refresh_chats(app, store);
+                                    app.set_info(vec![
+                                        format!("Chat '{}' created", id),
+                                        format!("Key: {}", hex::encode(&encryption_key)),
+                                    ]);
+                                }
+                                Err(e) => app.set_error(format!("Chat created on server but local save failed: {e}")),
+                            }
+                        }
+                        Ok(r) => app.set_error(format!("Server rejected: {}", r.error)),
                         Err(e) => app.set_error(format!("Error: {e}")),
                     }
                 }
@@ -1044,6 +1062,12 @@ fn new_aes_key_hex() -> String {
     use m_core::crypto::algorithms::symmetric::Aes256Gcm;
     use m_core::crypto::{CryptoKey, SymmetricCipher};
     hex::encode(Aes256Gcm::new().get_key().as_bytes())
+}
+
+fn new_aes_key_bytes() -> Vec<u8> {
+    use m_core::crypto::algorithms::symmetric::Aes256Gcm;
+    use m_core::crypto::{CryptoKey, SymmetricCipher};
+    Aes256Gcm::new().get_key().as_bytes().to_vec()
 }
 
 fn address_short(addr: &str) -> String {
