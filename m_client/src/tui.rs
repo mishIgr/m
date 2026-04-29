@@ -95,6 +95,7 @@ struct App {
 
     input: String,
     cursor_pos: usize,
+    info_scroll: u16,
 }
 
 impl App {
@@ -115,6 +116,7 @@ impl App {
             chats_cursor: 0,
             input: String::new(),
             cursor_pos: 0,
+            info_scroll: 0,
         }
     }
 
@@ -139,6 +141,7 @@ impl App {
     }
 
     fn set_info(&mut self, lines: Vec<String>) {
+        self.info_scroll = 0;
         self.overlay = Overlay::Info(lines);
     }
 }
@@ -650,6 +653,9 @@ async fn exec_chats(
                 "  history [--limit N]    Fetch chat history".into(),
                 "  import <path>          Import chat from binary file".into(),
                 "  export <path>          Export selected chat to binary file".into(),
+                "  admin create-chat <id> Create chat on server, generate key, save locally".into(),
+                "  admin delete-chat <id> Delete chat on server".into(),
+                "  admin list-chats       List chats on server".into(),
                 "  servers                Back to server list".into(),
             ]);
         }
@@ -832,6 +838,81 @@ async fn exec_chats(
                     Err(e) => app.set_error(format!("Error: {e}")),
                 },
                 Err(e) => app.set_error(format!("Connection error: {e}")),
+            }
+        }
+        "admin" => {
+            if words.len() < 2 {
+                app.set_error("Usage: admin <create-chat|delete-chat|list-chats> [args]"); return;
+            }
+            let server = match store.load_server(server_id) {
+                Ok(s) => s,
+                Err(e) => { app.set_error(format!("Error loading server: {e}")); return; }
+            };
+            let admin_key = match server.admin_key_bytes.clone() {
+                Some(k) => k,
+                None => { app.set_error("No admin key for this server"); return; }
+            };
+            let mut transport = match Transport::connect(&server.address, &server.shared_key_bytes).await {
+                Ok(t) => t,
+                Err(e) => { app.set_error(format!("Connection error: {e}")); return; }
+            };
+            let sub = words[1].to_lowercase();
+            match sub.as_str() {
+                "create-chat" => {
+                    let id = match words.get(2) {
+                        Some(s) if !s.is_empty() => *s,
+                        _ => { app.set_error("Usage: admin create-chat <chat_id>"); return; }
+                    };
+                    let encryption_key = new_aes_key_bytes();
+                    match transport.create_chat(&admin_key, id, 1000, 10_485_760).await {
+                        Ok(r) if r.success => {
+                            let card = crate::config::ChatCard {
+                                server_id: server_id.to_string(),
+                                chat_id: id.to_string(),
+                                name: id.to_string(),
+                                encryption_key: encryption_key.clone(),
+                            };
+                            match store.save_chat_card(&card) {
+                                Ok(()) => {
+                                    refresh_chats(app, store);
+                                    app.set_info(vec![
+                                        format!("Chat '{}' created", id),
+                                        format!("Key: {}", hex::encode(&encryption_key)),
+                                    ]);
+                                }
+                                Err(e) => app.set_error(format!("Chat created on server but local save failed: {e}")),
+                            }
+                        }
+                        Ok(r) => app.set_error(format!("Server rejected: {}", r.error)),
+                        Err(e) => app.set_error(format!("Error: {e}")),
+                    }
+                }
+                "delete-chat" => {
+                    let id = match words.get(2) {
+                        Some(s) if !s.is_empty() => *s,
+                        _ => { app.set_error("Usage: admin delete-chat <chat_id>"); return; }
+                    };
+                    match transport.delete_chat(&admin_key, id).await {
+                        Ok(r) if r.success => app.set_info(vec![format!("Chat '{}' deleted", id)]),
+                        Ok(r) => app.set_error(format!("Failed: {}", r.error)),
+                        Err(e) => app.set_error(format!("Error: {e}")),
+                    }
+                }
+                "list-chats" => {
+                    match transport.list_chats(&admin_key).await {
+                        Ok(r) => {
+                            if r.chats.is_empty() {
+                                app.set_info(vec!["No chats on server".into()]);
+                            } else {
+                                app.set_info(r.chats.iter().map(|c| {
+                                    format!("  {} ({}..{})", c.chat_id, c.earliest_timestamp_ms, c.latest_timestamp_ms)
+                                }).collect());
+                            }
+                        }
+                        Err(e) => app.set_error(format!("Error: {e}")),
+                    }
+                }
+                _ => app.set_error(format!("Unknown admin command: {sub}")),
             }
         }
         _ => app.set_error(format!("Unknown command: {}. Type 'help'.", words[0])),
@@ -1153,14 +1234,20 @@ async fn run_inner(
                     if key.code == KeyCode::Up {
                         match &app.overlay {
                             Overlay::ShareData(_) => overlay_cursor_up(&mut app),
+                            Overlay::Info(_) => { app.info_scroll = app.info_scroll.saturating_sub(1); }
                             _ => cursor_up(&mut app),
                         }
                         continue;
                     }
                     if key.code == KeyCode::Down {
-                        match &app.overlay {
-                            Overlay::ShareData(_) => overlay_cursor_down(&mut app),
-                            _ => cursor_down(&mut app),
+                        if let Overlay::Info(ref lines) = app.overlay {
+                            let max = lines.len().saturating_sub(1) as u16;
+                            app.info_scroll = (app.info_scroll + 1).min(max);
+                        } else {
+                            match &app.overlay {
+                                Overlay::ShareData(_) => overlay_cursor_down(&mut app),
+                                _ => cursor_down(&mut app),
+                            }
                         }
                         continue;
                     }
@@ -1732,7 +1819,7 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow),
             Line::from(vec![
                 Span::styled(format!(" {}> ", prompt), Style::default().fg(Color::Yellow)),
-                Span::raw(&app.input),
+                Span::styled(&app.input, Style::default().fg(Color::White)),
             ]),
         )
     } else {
@@ -1740,7 +1827,7 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Cyan),
             Line::from(vec![
                 Span::styled(format!(" {}> ", prompt), Style::default().fg(Color::Green)),
-                Span::raw(&app.input),
+                Span::styled(&app.input, Style::default().fg(Color::White)),
             ]),
         )
     };
@@ -1772,16 +1859,21 @@ fn draw_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 Span::styled("  [ESC or Enter to close]", Style::default().fg(Color::DarkGray))
             )))
             .collect();
-            render_overlay_box(f, area, " Error ", &lines, Color::Red);
+            render_overlay_box(f, area, " Error ", &lines, Color::Red, 0);
         }
         Overlay::Info(lines) => {
-            let ls: Vec<Line> = lines.iter()
+            let mut ls: Vec<Line> = lines.iter()
                 .map(|s| Line::from(s.as_str()))
-                .chain(std::iter::once(Line::from(
-                    Span::styled("  [ESC or Enter to close]", Style::default().fg(Color::DarkGray))
-                )))
                 .collect();
-            render_overlay_box(f, area, " Info ", &ls, Color::Cyan);
+            let popup_h = (ls.len() as u16 + 3).min(area.height.saturating_sub(4));
+            let visible = popup_h.saturating_sub(2) as usize;
+            let hint = if ls.len() > visible {
+                "  [↑/↓ scroll  ESC close]"
+            } else {
+                "  [ESC or Enter to close]"
+            };
+            ls.push(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))));
+            render_overlay_box(f, area, " Info ", &ls, Color::Cyan, app.info_scroll);
         }
         Overlay::ShareData(step) => {
             draw_share_wizard(f, area, step);
@@ -1789,7 +1881,7 @@ fn draw_overlay(f: &mut ratatui::Frame, area: Rect, app: &App) {
     }
 }
 
-fn render_overlay_box(f: &mut ratatui::Frame, area: Rect, title: &str, lines: &[Line], color: Color) {
+fn render_overlay_box(f: &mut ratatui::Frame, area: Rect, title: &str, lines: &[Line], color: Color, scroll: u16) {
     let max_w = area.width.saturating_sub(8).min(80);
     let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(max_w)) / 2;
@@ -1803,7 +1895,9 @@ fn render_overlay_box(f: &mut ratatui::Frame, area: Rect, title: &str, lines: &[
         .title(title);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    let para = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(para, inner);
 }
 
