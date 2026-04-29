@@ -89,11 +89,13 @@ impl ConnectionManager {
     }
 
     pub fn handle_unavailable_server(&mut self, server_id: &str) {
+        m_core::log_error!("connection_manager: server unavailable server={}", server_id);
         self.cancels.remove(server_id);
         let _ = self.store.set_server_state(server_id, NodeState::Unavailable);
     }
 
     pub fn handle_disconnected(&mut self, server_id: &str) {
+        m_core::log_info!("connection_manager: server disconnected server={}", server_id);
         self.cancels.remove(server_id);
         let _ = self.store.set_server_state(server_id, NodeState::Unavailable);
     }

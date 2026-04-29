@@ -38,22 +38,28 @@ pub async fn subscribe(
 ) -> Result<()> {
     let sid = server_id.to_string();
 
+    m_core::log_info!("live: connecting to server={} address={} chats={}", sid, address, chats.len());
+
     let mut channel_transport = match transport::Transport::connect(address, shared_key_bytes).await {
         Ok(t) => t,
         Err(e) => {
+            m_core::log_error!("live: connect failed server={} error={}", sid, e);
             let _ = event_tx.send(LiveEvent::ServerUnavailable(sid.clone()));
             return Err(e);
         }
     };
     let cipher = channel_transport.cipher().clone();
+    m_core::log_info!("live: transport connected server={}", sid);
 
     let (tx, mut inbound) = match channel_transport.open_channel().await {
         Ok(pair) => pair,
         Err(e) => {
+            m_core::log_error!("live: open_channel failed server={} error={}", sid, e);
             let _ = event_tx.send(LiveEvent::ServerUnavailable(sid.clone()));
             return Err(e);
         }
     };
+    m_core::log_info!("live: channel opened server={}", sid);
 
     let chat_keys: HashMap<String, Vec<u8>> = chats.iter()
         .map(|(id, rec)| (id.clone(), rec.encryption_key_bytes.clone()))
@@ -73,6 +79,7 @@ pub async fn subscribe(
     };
     let envelope = make_envelope(&cipher, &subscribe_event)?;
     tx.send(envelope).await.context("failed to send subscribe")?;
+    m_core::log_info!("live: subscribe sent server={} chats={}", sid, subscriptions.len());
 
     let chat_names: HashMap<String, String> = chats.iter()
         .map(|(id, rec)| (id.clone(), rec.name.clone()))
@@ -84,10 +91,14 @@ pub async fn subscribe(
                 break;
             }
             item = inbound.next() => {
-                let Some(result) = item else { break; };
+                let Some(result) = item else {
+                    m_core::log_info!("live: inbound stream closed server={}", sid);
+                    break;
+                };
                 let envelope = match result {
                     Ok(e) => e,
                     Err(e) => {
+                        m_core::log_error!("live: stream error server={} error={}", sid, e);
                         let _ = event_tx.send(LiveEvent::Error {
                             server_id: sid.clone(),
                             message: format!("Stream error: {e}"),
@@ -173,6 +184,7 @@ pub async fn subscribe(
         }
     }
 
+    m_core::log_info!("live: subscribe loop exited server={}, sending Disconnected", sid);
     let _ = event_tx.send(LiveEvent::Disconnected(sid));
     Ok(())
 }
