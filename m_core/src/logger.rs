@@ -239,17 +239,20 @@ macro_rules! log_error {
 
 pub fn init_logger(config: LoggerConfig) -> io::Result<()> {
     let logger = Logger::new(config)?;
-    let mut global = M_LOGGER.lock().unwrap();
-    *global = Some(logger);
+    {
+        let mut global = M_LOGGER.lock().unwrap();
+        *global = Some(logger);
+    }
     log_info!("init logger");
     Ok(())
 }
 
 pub fn reconfigure_logger(config: LoggerConfig) -> io::Result<()> {
-    // сначала создаём новый логгер — только потом берём мьютекс
     let logger = Logger::new(config)?;
-    let mut global = M_LOGGER.lock().unwrap();
-    *global = Some(logger);
+    {
+        let mut global = M_LOGGER.lock().unwrap();
+        *global = Some(logger);
+    }
     log_info!("reconfigure logger");
     Ok(())
 }
