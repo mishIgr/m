@@ -49,10 +49,6 @@ impl ConnectionManager {
         let chats = self.store.list_enabled_chats_for_server(server_id)
             .unwrap_or_default();
 
-        if chats.is_empty() {
-            return;
-        }
-
         let chat_pairs: Vec<_> = chats.iter()
             .map(|c| (c.chat_id.clone(), c.clone()))
             .collect();
