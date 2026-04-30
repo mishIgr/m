@@ -191,6 +191,7 @@ async fn execute_command(
 
     let words: Vec<&str> = trimmed.split_whitespace().collect();
     let cmd = words[0].to_lowercase();
+    m_core::log_debug!("tui: execute_command cmd={} screen={:?}", cmd, app.screen);
 
     // ── Global navigation ────────────────────────────────────────────────────
     match cmd.as_str() {
@@ -764,6 +765,7 @@ async fn exec_chats(
                 app.set_error("Usage: send <message>"); return;
             }
             let message = parts[1];
+            m_core::log_debug!("tui: send command server={}", server_id);
             let chat_id = match active_chat_id(app) {
                 Some(id) => id,
                 None => {
@@ -796,6 +798,7 @@ async fn exec_chats(
                     app.chats[app.chats_cursor].chat_id.clone()
                 }
             };
+            m_core::log_debug!("tui: history command server={} chat_id={}", server_id, chat_id);
             let mut limit = 50u32;
             for i in 1..words.len() {
                 if words[i] == "--limit" {
@@ -1180,6 +1183,7 @@ async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     store: Store,
 ) -> Result<()> {
+    m_core::log_info!("tui: starting");
     let mut app = App::new();
     refresh_contacts(&mut app, &store);
 
@@ -1187,7 +1191,9 @@ async fn run_inner(
     let mut manager = ConnectionManager::new(store.clone(), live_event_tx.clone());
     let mut share_state: Option<(CancellationToken, Option<tokio::process::Child>)> = None;
 
-    let _ = manager.start_all_enabled();
+    if let Err(e) = manager.start_all_enabled() {
+        m_core::log_warn!("tui: start_all_enabled failed: {}", e);
+    }
 
     loop {
         draw(terminal, &app)?;
@@ -1290,6 +1296,7 @@ async fn run_inner(
                         if let LiveMode::On { server_id, chat_id, .. } = &app.live_mode {
                             let sid = server_id.clone();
                             let cid = chat_id.clone();
+                            m_core::log_debug!("tui: live send server={} chat={}", sid, cid);
                             match store.load_server(&sid) {
                                 Ok(server) => match store.load_chat(&sid, &cid) {
                                     Ok(chat) => match Transport::connect(&server.address, &server.shared_key_bytes).await {
@@ -1420,8 +1427,9 @@ fn cursor_down(app: &mut App) {
 fn handle_live_event(event: LiveEvent, app: &mut App, manager: &mut ConnectionManager, store: &Store) {
     match event {
         LiveEvent::Message(msg) => {
+            m_core::log_debug!("tui: LiveEvent::Message server={} chat_id={} chat_name={}", msg.server_id, msg.chat_id, msg.chat_name);
             if let LiveMode::On { server_id, chat_id, messages, scroll } = &mut app.live_mode {
-                if *server_id == msg.server_id && *chat_id == msg.chat_name {
+                if *server_id == msg.server_id && *chat_id == msg.chat_id {
                     let line = format!("[{}] {}", msg.timestamp, msg.text);
                     messages.push_back(line);
                     if messages.len() > MAX_MESSAGES { messages.pop_front(); }
@@ -1430,11 +1438,13 @@ fn handle_live_event(event: LiveEvent, app: &mut App, manager: &mut ConnectionMa
                 }
             }
         }
-        LiveEvent::SyncComplete { .. } => {
+        LiveEvent::SyncComplete { _server_id: sid, _chat_name: cname } => {
+            m_core::log_debug!("tui: LiveEvent::SyncComplete server={} chat={}", sid, cname);
             refresh_chats(app, store);
             refresh_servers(app, store);
         }
         LiveEvent::Error { server_id, message } => {
+            m_core::log_warn!("tui: LiveEvent::Error server={} message={}", server_id, message);
             if let Screen::Chats { server_id: sid } = &app.screen {
                 if *sid == server_id {
                     app.set_error(format!("[{server_id}] {message}"));
@@ -1442,10 +1452,12 @@ fn handle_live_event(event: LiveEvent, app: &mut App, manager: &mut ConnectionMa
             }
         }
         LiveEvent::ServerUnavailable(sid) => {
+            m_core::log_warn!("tui: LiveEvent::ServerUnavailable server={}", sid);
             manager.handle_unavailable_server(&sid);
             refresh_servers(app, store);
         }
         LiveEvent::Disconnected(sid) => {
+            m_core::log_info!("tui: LiveEvent::Disconnected server={}", sid);
             manager.handle_disconnected(&sid);
             refresh_servers(app, store);
         }
@@ -1479,6 +1491,7 @@ async fn cleanup_and_quit(
     manager: &mut ConnectionManager,
     share_state: &mut Option<(CancellationToken, Option<tokio::process::Child>)>,
 ) {
+    m_core::log_info!("tui: cleanup_and_quit");
     if let Some((cancel, mut tor_child)) = share_state.take() {
         cancel.cancel();
         if let Some(ref mut child) = tor_child { let _ = child.kill().await; }

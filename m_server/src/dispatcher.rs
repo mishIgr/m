@@ -114,13 +114,17 @@ impl Dispatcher {
 
     pub fn remove_connection(&mut self, conn_id: u64) {
         if let Some(conn) = self.connections.remove(&conn_id) {
+            let pending_count = conn.pending_acks.len();
+            let subscribed = conn.subscribed_chats.len();
             for chat_id in &conn.subscribed_chats {
                 if let Some(subs) = self.subscriptions.get_mut(chat_id) {
                     subs.remove(&conn_id);
                 }
             }
+            m_core::log_info!("dispatcher: remove_connection conn={} subscribed_chats={} abandoned_pending_acks={}", conn_id, subscribed, pending_count);
+        } else {
+            m_core::log_warn!("dispatcher: remove_connection conn={} not found (already removed?)", conn_id);
         }
-        m_core::log_info!("Connection removed: {}", conn_id);
     }
 
     pub async fn subscribe(&mut self, conn_id: u64, chats: Vec<ChatSubscription>) {
@@ -130,10 +134,14 @@ impl Dispatcher {
     }
 
     async fn add_subscription(&mut self, conn_id: u64, chat_id: &str, last_ts: i64) {
-        let Some(buffer) = self.chat_buffers.get(chat_id) else { return };
+        let Some(buffer) = self.chat_buffers.get(chat_id) else {
+            m_core::log_warn!("dispatcher: add_subscription chat not found conn={} chat={}", conn_id, chat_id);
+            return;
+        };
 
         let messages: Vec<_> = buffer.get_after(last_ts).into_iter().cloned().collect();
         let latest = buffer.latest_timestamp_ms();
+        m_core::log_debug!("dispatcher: add_subscription conn={} chat={} last_ts={} catchup_count={} latest_ts={}", conn_id, chat_id, last_ts, messages.len(), latest);
 
         self.subscriptions
             .entry(chat_id.to_string())
@@ -162,17 +170,23 @@ impl Dispatcher {
                 },
             );
 
-            let _ = conn.stream_tx.send(ServerEvent {
+            if let Err(e) = conn.stream_tx.send(ServerEvent {
                 event: Some(server_event::Event::Message(chat_msg)),
-            }).await;
+            }).await {
+                m_core::log_warn!("dispatcher: add_subscription send failed conn={} chat={} ts={}: {}", conn_id, chat_id, msg.timestamp_ms, e);
+            }
         }
 
-        let _ = conn.stream_tx.send(ServerEvent {
+        if let Err(e) = conn.stream_tx.send(ServerEvent {
             event: Some(server_event::Event::SyncComplete(SyncComplete {
                 chat_id: chat_id.to_string(),
                 synced_up_timestamp_ms: latest,
             })),
-        }).await;
+        }).await {
+            m_core::log_warn!("dispatcher: add_subscription SyncComplete send failed conn={} chat={}: {}", conn_id, chat_id, e);
+        } else {
+            m_core::log_debug!("dispatcher: add_subscription SyncComplete sent conn={} chat={} latest_ts={}", conn_id, chat_id, latest);
+        }
     }
 
     pub async fn fanout(&mut self, chat_id: &str, message: &ChatMessage) {
@@ -180,6 +194,7 @@ impl Dispatcher {
             .get(chat_id)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
+        m_core::log_debug!("dispatcher: fanout chat={} subscriber_count={} msg_ts={} msg_id={}", chat_id, conn_ids.len(), message.timestamp_ms, message.message_id);
 
         let timeout = Duration::from_secs(self.delivery_config.ack_timeout_secs);
 
@@ -195,16 +210,24 @@ impl Dispatcher {
                 },
             );
 
-            let _ = conn.stream_tx.send(ServerEvent {
+            if let Err(e) = conn.stream_tx.send(ServerEvent {
                 event: Some(server_event::Event::Message(message.clone())),
-            }).await;
+            }).await {
+                m_core::log_warn!("dispatcher: fanout send failed conn={} chat={} ts={}: {}", conn_id, chat_id, message.timestamp_ms, e);
+            }
         }
     }
 
     pub fn handle_ack(&mut self, conn_id: u64, ack: &MessageAck) {
         if let Some(conn) = self.connections.get_mut(&conn_id) {
-            conn.pending_acks.remove(&(ack.chat_id.clone(), ack.timestamp_ms as i64));
-            m_core::log_debug!("Ack: conn={} chat={} ts={}", conn_id, ack.chat_id, ack.timestamp_ms);
+            let key = (ack.chat_id.clone(), ack.timestamp_ms as i64);
+            if conn.pending_acks.remove(&key).is_some() {
+                m_core::log_debug!("dispatcher: handle_ack matched conn={} chat={} ts={}", conn_id, ack.chat_id, ack.timestamp_ms);
+            } else {
+                m_core::log_warn!("dispatcher: handle_ack NOT FOUND conn={} chat={} ts={} (duplicate or mismatch)", conn_id, ack.chat_id, ack.timestamp_ms);
+            }
+        } else {
+            m_core::log_warn!("dispatcher: handle_ack unknown conn={} chat={} ts={}", conn_id, ack.chat_id, ack.timestamp_ms);
         }
     }
 
@@ -232,11 +255,13 @@ impl Dispatcher {
                 pending.attempts += 1;
                 pending.next_retry_at = now + timeout * pending.attempts;
 
-                let _ = tx.send(ServerEvent {
+                if let Err(e) = tx.send(ServerEvent {
                     event: Some(server_event::Event::Message(pending.message.clone())),
-                }).await;
-
-                m_core::log_debug!("Retry #{}: conn={} chat={} ts={}", pending.attempts, conn_id, key.0, key.1);
+                }).await {
+                    m_core::log_warn!("dispatcher: retry_pending send failed conn={} chat={} ts={} attempt={}: {}", conn_id, key.0, key.1, pending.attempts, e);
+                } else {
+                    m_core::log_debug!("dispatcher: retry_pending sent conn={} chat={} ts={} attempt={}", conn_id, key.0, key.1, pending.attempts);
+                }
             }
 
             for key in to_remove {

@@ -175,9 +175,13 @@ where
 
         let mut d = self.dispatcher.lock().await;
         let buffer = d.chat_buffers.get_mut(&req.chat_id)
-            .ok_or_else(|| Status::not_found("chat not found"))?;
+            .ok_or_else(|| {
+                m_core::log_warn!("service: send_message chat not found chat_id={}", req.chat_id);
+                Status::not_found("chat not found")
+            })?;
 
         let (timestamp_ms, accepted) = buffer.push(req.message_id.clone(), req.encrypted_payload.clone());
+        m_core::log_debug!("service: send_message chat_id={} message_id={} accepted={} ts={}", req.chat_id, req.message_id, accepted, timestamp_ms);
 
         if accepted {
             let msg = ChatMessage {
@@ -248,6 +252,7 @@ where
                 let data = match encrypt_raw::<C, _>(&fwd_cipher, &server_event) {
                     Ok(d) => d,
                     Err(e) => {
+                        m_core::log_error!("service: channel fwd_task encrypt failed conn={}: {}", conn_id, e);
                         let _ = fwd_tx.send(Err(e)).await;
                         return;
                     }
@@ -256,6 +261,7 @@ where
                     return;
                 }
             }
+            m_core::log_debug!("service: channel fwd_task exited conn={}", conn_id);
         });
 
         tokio::spawn(async move {
@@ -263,6 +269,7 @@ where
                 let envelope = match result {
                     Ok(e) => e,
                     Err(e) => {
+                        m_core::log_warn!("service: channel inbound stream error conn={}: {}", conn_id, e);
                         let _ = outer_tx.send(Err(e)).await;
                         break;
                     }
@@ -271,6 +278,7 @@ where
                 let event: ClientEvent = match decrypt_raw::<C, _>(&cipher, &envelope.data) {
                     Ok(e) => e,
                     Err(e) => {
+                        m_core::log_error!("service: channel inbound decrypt failed conn={}: {}", conn_id, e);
                         let _ = outer_tx.send(Err(e)).await;
                         break;
                     }
@@ -278,16 +286,19 @@ where
 
                 match event.event {
                     Some(client_event::Event::Subscribe(sub)) => {
+                        m_core::log_debug!("service: channel inbound Subscribe conn={} chat_count={}", conn_id, sub.chats.len());
                         let mut d = dispatcher.lock().await;
                         d.subscribe(conn_id, sub.chats).await;
                     }
 
                     Some(client_event::Event::Ack(ack)) => {
+                        m_core::log_debug!("service: channel inbound Ack conn={} chat={} ts={}", conn_id, ack.chat_id, ack.timestamp_ms);
                         let mut d = dispatcher.lock().await;
                         d.handle_ack(conn_id, &ack);
                     }
 
                     None => {
+                        m_core::log_warn!("service: channel inbound empty client event conn={}", conn_id);
                         let error_event = ServerEvent {
                             event: Some(server_event::Event::Error(ErrorEvent {
                                 code: "EMPTY_EVENT".to_string(),
