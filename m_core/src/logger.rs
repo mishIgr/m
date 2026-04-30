@@ -139,7 +139,7 @@ impl Logger {
     }
 
     fn should_log(&self, level: Level) -> bool {
-        level >= self.min_level
+        level <= self.min_level
     }
 
     /// Только в debug-сборке. В release вызов компилируется в ничто.
