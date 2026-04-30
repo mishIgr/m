@@ -96,7 +96,12 @@ impl Transport {
         let key: Key<32> = CryptoKey::from_bytes(shared_key_bytes)
             .map_err(|e| anyhow::anyhow!("bad shared key: {e}"))?;
         let cipher = Aes256Gcm::from_key(key);
-        let client = MessengerClient::connect(address.to_string()).await
+        let uri = if address.contains("://") {
+            address.to_string()
+        } else {
+            format!("http://{}", address)
+        };
+        let client = MessengerClient::connect(uri).await
             .map_err(|e| {
                 m_core::log_error!("transport: failed to connect to {}: {}", address, e);
                 anyhow::anyhow!("failed to connect to server: {e}")
