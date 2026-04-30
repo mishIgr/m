@@ -664,11 +664,32 @@ async fn exec_chats(
             if app.chats.is_empty() {
                 app.set_error("No chats"); return;
             }
-            let chat = &app.chats[app.chats_cursor];
+            let chat_id = app.chats[app.chats_cursor].chat_id.clone();
+            let mut initial: VecDeque<String> = VecDeque::new();
+            if let (Ok(server), Ok(chat_rec)) = (
+                store.load_server(server_id),
+                store.load_chat(server_id, &chat_id),
+            ) {
+                if let Ok(mut t) = Transport::connect(&server.address, &server.shared_key_bytes).await {
+                    if let Ok(resp) = t.get_history(&chat_id, 0, 0, 100).await {
+                        for msg in &resp.messages {
+                            let text = crate::transport::decrypt_payload(
+                                &msg.encrypted_payload,
+                                &chat_rec.encryption_key_bytes,
+                                &msg.chat_id,
+                            ).unwrap_or_else(|_| "<decryption failed>".into());
+                            let ts = chrono::DateTime::from_timestamp_millis(msg.timestamp_ms)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| msg.timestamp_ms.to_string());
+                            initial.push_back(format!("[{ts}] {text}"));
+                        }
+                    }
+                }
+            }
             app.live_mode = LiveMode::On {
                 server_id: server_id.to_string(),
-                chat_id: chat.chat_id.clone(),
-                messages: VecDeque::new(),
+                chat_id,
+                messages: initial,
                 scroll: 0,
             };
         }
@@ -1258,14 +1279,14 @@ async fn run_inner(
                         continue;
                     }
 
-                    // Scroll live messages panel
+                    // Scroll live messages panel (scroll = lines from bottom, 0 = following)
                     if let LiveMode::On { scroll, messages, .. } = &mut app.live_mode {
                         if key.code == KeyCode::PageUp {
-                            *scroll = scroll.saturating_sub(5);
+                            *scroll = (*scroll + 5).min(messages.len() as u16);
                             continue;
                         }
                         if key.code == KeyCode::PageDown {
-                            *scroll = (*scroll + 5).min(messages.len().saturating_sub(1) as u16);
+                            *scroll = scroll.saturating_sub(5);
                             continue;
                         }
                     }
@@ -1433,8 +1454,6 @@ fn handle_live_event(event: LiveEvent, app: &mut App, manager: &mut ConnectionMa
                     let line = format!("[{}] {}", msg.timestamp, msg.text);
                     messages.push_back(line);
                     if messages.len() > MAX_MESSAGES { messages.pop_front(); }
-                    // Auto-scroll to bottom
-                    *scroll = messages.len().saturating_sub(1) as u16;
                 }
             }
         }
@@ -1745,7 +1764,7 @@ fn draw_chats(f: &mut ratatui::Frame, area: Rect, app: &App) {
             let lines: Vec<Line> = messages.iter().map(|s| Line::from(s.as_str())).collect();
             let height = right_inner.height as usize;
             let auto_scroll = messages.len().saturating_sub(height) as u16;
-            let actual_scroll = (*scroll).max(auto_scroll.saturating_sub(0));
+            let actual_scroll = auto_scroll.saturating_sub(*scroll);
             let para = Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .scroll((actual_scroll, 0));
