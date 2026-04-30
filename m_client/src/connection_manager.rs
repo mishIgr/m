@@ -73,7 +73,7 @@ impl ConnectionManager {
         tokio::spawn(async move {
             m_core::log_debug!("connection_manager: live task started server={}", sid);
             match live::subscribe(&sid, &addr, &key, &chat_pairs, store, cancel, event_tx).await {
-                Ok(()) => m_core::log_debug!("connection_manager: live task exited cleanly server={}", sid),
+                Ok(()) => { m_core::log_debug!("connection_manager: live task exited cleanly server={}", sid) }
                 Err(e) => m_core::log_error!("connection_manager: live task exited with error server={}: {}", sid, e),
             }
         });

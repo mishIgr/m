@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use prost::Message;
 use tonic::Request;
 
@@ -160,7 +160,7 @@ impl Transport {
                 m_core::log_error!("transport: list_chats rpc failed: {}", e);
                 anyhow::anyhow!("list_chats RPC failed: {e}")
             })?;
-        let result = decrypt_envelope(&self.cipher, &resp.into_inner())?;
+        let result: ListChatsResponse = decrypt_envelope(&self.cipher, &resp.into_inner())?;
         m_core::log_debug!("transport: list_chats returned {} chats", result.chats.len());
         Ok(result)
     }
@@ -185,7 +185,7 @@ impl Transport {
                 m_core::log_error!("transport: send_message rpc failed chat_id={}: {}", chat_id, e);
                 anyhow::anyhow!("send_message RPC failed: {e}")
             })?;
-        let result = decrypt_envelope(&self.cipher, &resp.into_inner())?;
+        let result: SendMessageResponse = decrypt_envelope(&self.cipher, &resp.into_inner())?;
         if !result.accepted {
             m_core::log_warn!("transport: send_message rejected chat_id={} reason={}", chat_id, result.error);
         } else {
@@ -214,7 +214,7 @@ impl Transport {
                 m_core::log_error!("transport: get_history rpc failed chat_id={}: {}", chat_id, e);
                 anyhow::anyhow!("get_history RPC failed: {e}")
             })?;
-        let result = decrypt_envelope(&self.cipher, &resp.into_inner())?;
+        let result: GetHistoryResponse = decrypt_envelope(&self.cipher, &resp.into_inner())?;
         m_core::log_debug!("transport: get_history returned {} messages chat_id={}", result.messages.len(), chat_id);
         Ok(result)
     }

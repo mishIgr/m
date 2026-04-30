@@ -75,6 +75,7 @@ pub async fn subscribe(
             latest_timestamp_ms: if rec.last_synced_ts > 0 { rec.last_synced_ts as u64 } else { 0 },
         })
         .collect();
+    let subscriptions_count = subscriptions.len();
 
     let subscribe_event = ClientEvent {
         event: Some(client_event::Event::Subscribe(SubscribeRequest {
@@ -83,7 +84,7 @@ pub async fn subscribe(
     };
     let envelope = make_envelope(&cipher, &subscribe_event)?;
     tx.send(envelope).await.context("failed to send subscribe")?;
-    m_core::log_info!("live: subscribe sent server={} chats={}", sid, subscriptions.len());
+    m_core::log_info!("live: subscribe sent server={} chats={}", sid, subscriptions_count);
 
     let chat_names: HashMap<String, String> = chats.iter()
         .map(|(id, rec)| (id.clone(), rec.name.clone()))
