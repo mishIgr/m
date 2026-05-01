@@ -62,6 +62,7 @@ enum LiveMode {
         chat_id: String,
         messages: VecDeque<String>,
         scroll: u16,
+        last_date: Option<String>,
     },
 }
 
@@ -96,6 +97,9 @@ struct App {
     input: String,
     cursor_pos: usize,
     info_scroll: u16,
+
+    my_id: String,
+    my_name: String,
 }
 
 impl App {
@@ -117,6 +121,8 @@ impl App {
             input: String::new(),
             cursor_pos: 0,
             info_scroll: 0,
+            my_id: String::new(),
+            my_name: String::new(),
         }
     }
 
@@ -645,6 +651,7 @@ async fn exec_chats(
         "help" | "?" => {
             app.set_info(vec![
                 "servers/chats commands:".into(),
+                "  set-name <name>        Set your display name".into(),
                 "  enable                 Enable selected chat".into(),
                 "  disable                Disable selected chat".into(),
                 "  rename <name>          Rename selected chat".into(),
@@ -660,30 +667,32 @@ async fn exec_chats(
                 "  servers                Back to server list".into(),
             ]);
         }
+        "set-name" => {
+            if words.len() < 2 {
+                app.set_error("Usage: set-name <name>"); return;
+            }
+            let name = words[1..].join(" ");
+            match store.set_identity_name(&name) {
+                Ok(()) => { app.my_name = name; }
+                Err(e) => { app.set_error(format!("Error: {e}")); return; }
+            }
+        }
         "live" => {
             if app.chats.is_empty() {
                 app.set_error("No chats"); return;
             }
             let chat_id = app.chats[app.chats_cursor].chat_id.clone();
             let mut initial: VecDeque<String> = VecDeque::new();
-            if let (Ok(server), Ok(chat_rec)) = (
-                store.load_server(server_id),
-                store.load_chat(server_id, &chat_id),
-            ) {
-                if let Ok(mut t) = Transport::connect(&server.address, &server.shared_key_bytes).await {
-                    if let Ok(resp) = t.get_history(&chat_id, 0, 0, 100).await {
-                        for msg in &resp.messages {
-                            let text = crate::transport::decrypt_payload(
-                                &msg.encrypted_payload,
-                                &chat_rec.encryption_key_bytes,
-                                &msg.chat_id,
-                            ).unwrap_or_else(|_| "<decryption failed>".into());
-                            let ts = chrono::DateTime::from_timestamp_millis(msg.timestamp_ms)
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                                .unwrap_or_else(|| msg.timestamp_ms.to_string());
-                            initial.push_back(format!("[{ts}] {text}"));
-                        }
-                    }
+            let mut last_date: Option<String> = None;
+            if let Ok(stored) = store.get_messages(&chat_id, 100) {
+                for msg in stored {
+                    let (sid, sname) = parse_stored_sender(msg.sender.as_deref().unwrap_or(""));
+                    let display = resolve_sender_name(&app.contacts, &sid, &sname);
+                    let ts = chrono::DateTime::from_timestamp_millis(msg.timestamp_ms)
+                        .map(|dt| dt.format("%H:%M").to_string())
+                        .unwrap_or_else(|| msg.timestamp_ms.to_string());
+                    let line = format!("[{ts}] {display}: {msg.text}");
+                    push_with_date_sep(&mut initial, &mut last_date, msg.timestamp_ms, line);
                 }
             }
             app.live_mode = LiveMode::On {
@@ -691,6 +700,7 @@ async fn exec_chats(
                 chat_id,
                 messages: initial,
                 scroll: 0,
+                last_date,
             };
         }
         "enable" => {
@@ -802,8 +812,9 @@ async fn exec_chats(
                 Ok(c) => c,
                 Err(e) => { app.set_error(format!("Error: {e}")); return; }
             };
+            let payload = format!("{}\x1e{}\x1e{}", app.my_id, app.my_name, message);
             match Transport::connect(&server.address, &server.shared_key_bytes).await {
-                Ok(mut t) => match t.send_message(&chat_id, message, &chat.encryption_key_bytes).await {
+                Ok(mut t) => match t.send_message(&chat_id, &payload, &chat.encryption_key_bytes).await {
                     Ok(r) if r.accepted => {}
                     Ok(r) => app.set_error(format!("Rejected: {}", r.error)),
                     Err(e) => app.set_error(format!("Send error: {e}")),
@@ -837,23 +848,39 @@ async fn exec_chats(
             match Transport::connect(&server.address, &server.shared_key_bytes).await {
                 Ok(mut t) => match t.get_history(&chat_id, 0, 0, limit).await {
                     Ok(resp) => {
-                        let lines: Vec<String> = resp.messages.iter().map(|msg| {
-                            let text = crate::transport::decrypt_payload(
+                        let mut lines: Vec<String> = Vec::new();
+                        let mut hist_last_date: Option<String> = None;
+                        for msg in &resp.messages {
+                            let raw = crate::transport::decrypt_payload(
                                 &msg.encrypted_payload,
                                 &chat.encryption_key_bytes,
                                 &msg.chat_id,
                             ).unwrap_or_else(|_| "<decryption failed>".into());
+                            let (sid, sname, text) = {
+                                let mut parts = raw.splitn(3, '\x1e');
+                                let a = parts.next().unwrap_or("").to_string();
+                                let b = parts.next().unwrap_or("").to_string();
+                                let c = parts.next().map(|s| s.to_string()).unwrap_or_else(|| raw.clone());
+                                if raw.contains('\x1e') { (a, b, c) } else { (String::new(), String::new(), raw) }
+                            };
+                            let display = resolve_sender_name(&app.contacts, &sid, &sname);
+                            let date = msg_date(msg.timestamp_ms);
+                            if !date.is_empty() && hist_last_date.as_deref() != Some(date.as_str()) {
+                                lines.push(date_separator(&date));
+                                hist_last_date = Some(date);
+                            }
                             let ts = chrono::DateTime::from_timestamp_millis(msg.timestamp_ms)
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .map(|dt| dt.format("%H:%M").to_string())
                                 .unwrap_or_else(|| msg.timestamp_ms.to_string());
-                            format!("[{ts}] {text}")
-                        }).collect();
+                            lines.push(format!("[{ts}] {display}: {text}"));
+                        }
                         if lines.is_empty() {
                             app.set_info(vec!["No messages".into()]);
                         } else {
                             // Inject into live panel
-                            if let LiveMode::On { messages, .. } = &mut app.live_mode {
-                                for l in &lines { messages.push_back(l.clone()); }
+                            if let LiveMode::On { messages, last_date, .. } = &mut app.live_mode {
+                                for l in lines { messages.push_back(l); }
+                                *last_date = hist_last_date;
                             } else {
                                 app.set_info(lines);
                             }
@@ -1206,6 +1233,10 @@ async fn run_inner(
 ) -> Result<()> {
     m_core::log_info!("tui: starting");
     let mut app = App::new();
+    if let Ok(Some(identity)) = store.load_identity() {
+        app.my_id = identity.id.clone();
+        app.my_name = identity.name.clone().unwrap_or_default();
+    }
     refresh_contacts(&mut app, &store);
 
     let (live_event_tx, mut live_event_rx) = mpsc::unbounded_channel::<LiveEvent>();
@@ -1317,14 +1348,19 @@ async fn run_inner(
                         if let LiveMode::On { server_id, chat_id, .. } = &app.live_mode {
                             let sid = server_id.clone();
                             let cid = chat_id.clone();
+                            let my_id = app.my_id.clone();
+                            let my_name = app.my_name.clone();
                             m_core::log_debug!("tui: live send server={} chat={}", sid, cid);
                             match store.load_server(&sid) {
                                 Ok(server) => match store.load_chat(&sid, &cid) {
                                     Ok(chat) => match Transport::connect(&server.address, &server.shared_key_bytes).await {
-                                        Ok(mut t) => match t.send_message(&cid, &input, &chat.encryption_key_bytes).await {
-                                            Ok(r) if r.accepted => {}
-                                            Ok(r) => app.set_error(format!("Rejected: {}", r.error)),
-                                            Err(e) => app.set_error(format!("Send error: {e}")),
+                                        Ok(mut t) => {
+                                            let payload = format!("{}\x1e{}\x1e{}", my_id, my_name, input);
+                                            match t.send_message(&cid, &payload, &chat.encryption_key_bytes).await {
+                                                Ok(r) if r.accepted => {}
+                                                Ok(r) => app.set_error(format!("Rejected: {}", r.error)),
+                                                Err(e) => app.set_error(format!("Send error: {e}")),
+                                            }
                                         },
                                         Err(e) => app.set_error(format!("Connection error: {e}")),
                                     },
@@ -1424,6 +1460,47 @@ fn cursor_up(app: &mut App) {
     }
 }
 
+fn msg_date(timestamp_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(timestamp_ms)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+fn date_separator(date: &str) -> String {
+    format!("─── {} ───", date)
+}
+
+fn push_with_date_sep(messages: &mut VecDeque<String>, last_date: &mut Option<String>, timestamp_ms: i64, line: String) {
+    let date = msg_date(timestamp_ms);
+    if !date.is_empty() && last_date.as_deref() != Some(date.as_str()) {
+        messages.push_back(date_separator(&date));
+        *last_date = Some(date);
+    }
+    messages.push_back(line);
+}
+
+fn parse_stored_sender(sender: &str) -> (String, String) {
+    let mut parts = sender.splitn(2, '\x1e');
+    let id = parts.next().unwrap_or("").to_string();
+    let name = parts.next().unwrap_or("").to_string();
+    (id, name)
+}
+
+fn resolve_sender_name(contacts: &[ContactRecord], sender_id: &str, sender_name: &str) -> String {
+    if !sender_id.is_empty() {
+        if let Some(c) = contacts.iter().find(|c| c.id == sender_id) {
+            return c.name.clone();
+        }
+    }
+    if !sender_name.is_empty() {
+        sender_name.to_string()
+    } else if !sender_id.is_empty() {
+        sender_id[..sender_id.len().min(8)].to_string()
+    } else {
+        "?".to_string()
+    }
+}
+
 fn cursor_down(app: &mut App) {
     match &app.screen {
         Screen::Contacts => {
@@ -1449,11 +1526,13 @@ fn handle_live_event(event: LiveEvent, app: &mut App, manager: &mut ConnectionMa
     match event {
         LiveEvent::Message(msg) => {
             m_core::log_debug!("tui: LiveEvent::Message server={} chat_id={} chat_name={}", msg.server_id, msg.chat_id, msg.chat_name);
-            if let LiveMode::On { server_id, chat_id, messages, scroll } = &mut app.live_mode {
+            let display = resolve_sender_name(&app.contacts, &msg.sender_id, &msg.sender_name);
+            let line = format!("[{}] {}: {}", msg.timestamp, display, msg.text);
+            let ts_ms = msg.timestamp_ms;
+            if let LiveMode::On { server_id, chat_id, messages, last_date, .. } = &mut app.live_mode {
                 if *server_id == msg.server_id && *chat_id == msg.chat_id {
-                    let line = format!("[{}] {}", msg.timestamp, msg.text);
-                    messages.push_back(line);
-                    if messages.len() > MAX_MESSAGES { messages.pop_front(); }
+                    push_with_date_sep(messages, last_date, ts_ms, line);
+                    while messages.len() > MAX_MESSAGES { messages.pop_front(); }
                 }
             }
         }

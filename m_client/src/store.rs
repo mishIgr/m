@@ -66,6 +66,8 @@ pub struct StoredMessage {
     pub message_id: String,
     pub timestamp_ms: i64,
     pub text: String,
+    #[serde(default)]
+    pub sender: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,8 @@ pub struct IdentityRecord {
     pub signing_pk_bytes: Vec<u8>,
     pub tor_sk_bytes: Vec<u8>,
     pub tor_pk_bytes: Vec<u8>,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +252,23 @@ impl Store {
         let table_name = format!("{}{}", MESSAGES_TABLE_PREFIX, msg.chat_id);
         let table = self.db.table::<i64, StoredMessage>(&table_name)?;
         table.put(&msg.timestamp_ms, msg)?;
+        Ok(())
+    }
+
+    pub fn get_messages(&self, chat_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
+        let table_name = format!("{}{}", MESSAGES_TABLE_PREFIX, chat_id);
+        let table = self.db.table::<i64, StoredMessage>(&table_name)?;
+        let all: Vec<StoredMessage> = table.iter()?.into_iter().map(|(_, v)| v).collect();
+        let start = all.len().saturating_sub(limit);
+        Ok(all[start..].to_vec())
+    }
+
+    pub fn set_identity_name(&self, name: &str) -> Result<()> {
+        let table = self.db.table::<String, IdentityRecord>(IDENTITY_TABLE)?;
+        let mut record = table.get(&"self".to_string())?
+            .ok_or_else(|| anyhow::anyhow!("Identity not found"))?;
+        record.name = Some(name.to_string());
+        table.put(&"self".to_string(), &record)?;
         Ok(())
     }
 

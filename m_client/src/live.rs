@@ -14,8 +14,20 @@ pub struct LiveMessage {
     pub server_id: String,
     pub chat_id: String,
     pub chat_name: String,
+    pub sender_id: String,
+    pub sender_name: String,
     pub text: String,
     pub timestamp: String,
+    pub timestamp_ms: i64,
+}
+
+fn parse_payload(raw: &str) -> (String, String, String) {
+    let parts: Vec<&str> = raw.splitn(3, '\x1e').collect();
+    if parts.len() == 3 {
+        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string())
+    } else {
+        (String::new(), String::new(), raw.to_string())
+    }
 }
 
 pub enum LiveEvent {
@@ -136,7 +148,7 @@ pub async fn subscribe(
                             .cloned()
                             .unwrap_or_else(|| msg.chat_id.clone());
 
-                        let text = match chat_keys.get(&msg.chat_id) {
+                        let raw = match chat_keys.get(&msg.chat_id) {
                             Some(key) => match decrypt_payload(&msg.encrypted_payload, key, &msg.chat_id) {
                                 Ok(t) => t,
                                 Err(e) => {
@@ -147,8 +159,10 @@ pub async fn subscribe(
                             None => continue,
                         };
 
+                        let (sender_id, sender_name, text) = parse_payload(&raw);
+
                         let ts = match chrono::DateTime::from_timestamp_millis(msg.timestamp_ms) {
-                            Some(dt) => dt.format("%H:%M:%S").to_string(),
+                            Some(dt) => dt.format("%H:%M").to_string(),
                             None => {
                                 m_core::log_warn!("live: invalid timestamp_ms={} server={} chat={}, using raw value", msg.timestamp_ms, sid, msg.chat_id);
                                 msg.timestamp_ms.to_string()
@@ -160,6 +174,7 @@ pub async fn subscribe(
                             message_id: msg.message_id.clone(),
                             timestamp_ms: msg.timestamp_ms,
                             text: text.clone(),
+                            sender: Some(format!("{}\x1e{}", sender_id, sender_name)),
                         }) {
                             m_core::log_warn!("live: save_message failed server={} chat={} ts={} error={}", sid, msg.chat_id, msg.timestamp_ms, e);
                         }
@@ -168,8 +183,11 @@ pub async fn subscribe(
                             server_id: sid.clone(),
                             chat_id: msg.chat_id.clone(),
                             chat_name,
+                            sender_id,
+                            sender_name,
                             text,
                             timestamp: ts,
+                            timestamp_ms: msg.timestamp_ms,
                         }));
 
                         let ack = ClientEvent {
