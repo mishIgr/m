@@ -10,7 +10,7 @@ use tonic::{Request, Response, Status};
 use m_core::crypto::SymmetricEncryption;
 use m_core::proto::*;
 
-use crate::dispatcher::Dispatcher;
+use crate::dispatcher::{Dispatcher, bytes_to_u128};
 
 fn encrypt_raw<C: SymmetricEncryption, M: Message>(
     cipher: &C,
@@ -123,16 +123,18 @@ where
         self.verify_admin(&req.admin_key)
             .map_err(|e| { m_core::log_error!("service: create_chat admin key invalid"); e })?;
 
-        m_core::log_info!("service: create_chat chat_id={}", req.chat_id);
+        let chat_id: u128 = rand::random();
+        m_core::log_info!("service: create_chat name={} generated id={:032x}", req.name, chat_id);
         let mut d = self.dispatcher.lock().await;
         let success = d
-            .create_chat(&req.chat_id, req.max_messages, req.max_bytes)
+            .create_chat(chat_id, &req.name, req.max_messages, req.max_bytes)
             .map_err(|e| { m_core::log_error!("service: create_chat dispatcher error: {}", e); Status::internal(e.to_string()) })?;
 
-        m_core::log_info!("service: create_chat success={} chat_id={}", success, req.chat_id);
+        m_core::log_info!("service: create_chat success={} id={:032x}", success, chat_id);
         self.encrypt_response(&CreateChatResponse {
             success,
             error: if success { String::new() } else { "chat already exists".into() },
+            chat_id: chat_id.to_be_bytes().to_vec(),
         })
     }
 
@@ -143,9 +145,12 @@ where
         let req: DeleteChatRequest = self.decrypt_request(request)?;
         self.verify_admin(&req.admin_key)?;
 
+        let chat_id = bytes_to_u128(&req.chat_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
         let mut d = self.dispatcher.lock().await;
         let success = d
-            .delete_chat(&req.chat_id)
+            .delete_chat(chat_id)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         self.encrypt_response(&DeleteChatResponse {
@@ -173,30 +178,35 @@ where
     ) -> Result<Response<Envelope>, Status> {
         let req: SendMessageRequest = self.decrypt_request(request)?;
 
+        let chat_id = bytes_to_u128(&req.chat_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
         let mut d = self.dispatcher.lock().await;
-        let buffer = d.chat_buffers.get_mut(&req.chat_id)
+        let buffer = d.chat_buffers.get_mut(&chat_id)
             .ok_or_else(|| {
-                m_core::log_warn!("service: send_message chat not found chat_id={}", req.chat_id);
+                m_core::log_warn!("service: send_message chat not found chat_id={:032x}", chat_id);
                 Status::not_found("chat not found")
             })?;
 
-        let (timestamp_ms, accepted) = buffer.push(req.message_id.clone(), req.encrypted_payload.clone());
-        m_core::log_debug!("service: send_message chat_id={} message_id={} accepted={} ts={}", req.chat_id, req.message_id, accepted, timestamp_ms);
+        let message_id = format!("{:032x}", rand::random::<u128>());
+        let (timestamp_ms, accepted) = buffer.push(message_id.clone(), req.encrypted_payload.clone());
+        m_core::log_debug!("service: send_message chat_id={:032x} message_id={} accepted={} ts={}", chat_id, message_id, accepted, timestamp_ms);
 
         if accepted {
             let msg = ChatMessage {
                 chat_id: req.chat_id.clone(),
-                message_id: req.message_id,
+                message_id: message_id.clone(),
                 timestamp_ms,
                 encrypted_payload: req.encrypted_payload,
             };
-            d.fanout(&req.chat_id, &msg).await;
+            d.fanout(chat_id, &msg).await;
         }
 
         self.encrypt_response(&SendMessageResponse {
             accepted,
             timestamp_ms: timestamp_ms as u64,
             error: String::new(),
+            message_id,
         })
     }
 
@@ -206,16 +216,20 @@ where
     ) -> Result<Response<Envelope>, Status> {
         let req: GetHistoryRequest = self.decrypt_request(request)?;
 
+        let chat_id = bytes_to_u128(&req.chat_id)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
         let d = self.dispatcher.lock().await;
-        let buffer = d.chat_buffers.get(&req.chat_id)
+        let buffer = d.chat_buffers.get(&chat_id)
             .ok_or_else(|| Status::not_found("chat not found"))?;
 
         let stored = buffer.get_range(req.from_timestamp_ms as i64, req.to_timestamp_ms as i64);
+        let chat_id_bytes = chat_id.to_be_bytes().to_vec();
         let messages: Vec<ChatMessage> = stored
             .into_iter()
             .take(req.limit as usize)
             .map(|m| ChatMessage {
-                chat_id: req.chat_id.clone(),
+                chat_id: chat_id_bytes.clone(),
                 message_id: m.message_id.clone(),
                 timestamp_ms: m.timestamp_ms,
                 encrypted_payload: m.encrypted_payload.clone(),
@@ -292,7 +306,7 @@ where
                     }
 
                     Some(client_event::Event::Ack(ack)) => {
-                        m_core::log_debug!("service: channel inbound Ack conn={} chat={} ts={}", conn_id, ack.chat_id, ack.timestamp_ms);
+                        m_core::log_debug!("service: channel inbound Ack conn={} ts={}", conn_id, ack.timestamp_ms);
                         let mut d = dispatcher.lock().await;
                         d.handle_ack(conn_id, &ack);
                     }

@@ -39,6 +39,8 @@ pub struct PerformanceConfig {
 pub struct EncryptionConfig {
     pub user_key: String,
     pub admin_key: String,
+    #[serde(default)]
+    pub server_id: String,
 }
 
 pub fn expand_tilde_path(s: &str) -> String {
@@ -105,5 +107,19 @@ impl ServerConfig {
     pub fn admin_key_bytes(&self) -> Result<Vec<u8>> {
         hex::decode(&self.encryption.admin_key)
             .context("Failed to decode admin_key from hex")
+    }
+
+    pub fn server_id_u128(&self) -> u128 {
+        if self.encryption.server_id.is_empty() {
+            let id: u128 = rand::random();
+            eprintln!(
+                "WARNING: server_id not set in config. Generated: {:032x}. Set encryption.server_id in config.",
+                id
+            );
+            id
+        } else {
+            u128::from_str_radix(&self.encryption.server_id, 16)
+                .unwrap_or_else(|_| panic!("Invalid server_id in config: must be 32-char hex"))
+        }
     }
 }

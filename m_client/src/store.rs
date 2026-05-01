@@ -3,8 +3,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use m_core::crypto::Hash;
-use m_core::crypto::algorithms::hash::Blake3Hash;
 use m_core::db::{RedbStore, KvStore, Table};
 
 use crate::identity::ContactCard;
@@ -16,6 +14,19 @@ const CHATS_TABLE: &str = "chats";
 const MESSAGES_TABLE_PREFIX: &str = "messages:";
 const IDENTITY_TABLE: &str = "identity";
 const CONTACTS_TABLE: &str = "contacts";
+const PENDING_KEM_TABLE: &str = "pending_kem_offers";
+
+fn id_key(id: u128) -> String {
+    format!("{:032x}", id)
+}
+
+fn chat_key(server_id: u128, chat_id: u128) -> String {
+    format!("{:032x}:{:032x}", server_id, chat_id)
+}
+
+fn msg_table_name(chat_id: u128) -> String {
+    format!("{}{:032x}", MESSAGES_TABLE_PREFIX, chat_id)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeState {
@@ -34,15 +45,9 @@ impl fmt::Display for NodeState {
     }
 }
 
-fn address_hash(address: &str) -> String {
-    let hash_bytes = Blake3Hash::hash(address.as_bytes(), 16)
-        .expect("blake3 hash failed");
-    hex::encode(&hash_bytes[..4])
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerRecord {
-    pub id: String,
+    pub id: u128,
     pub name: String,
     pub address: String,
     pub shared_key_bytes: Vec<u8>,
@@ -50,19 +55,28 @@ pub struct ServerRecord {
     pub state: NodeState,
 }
 
+impl ServerRecord {
+    pub fn id_hex(&self) -> String { id_key(self.id) }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRecord {
-    pub server_id: String,
-    pub chat_id: String,
+    pub server_id: u128,
+    pub chat_id: u128,
     pub name: String,
     pub encryption_key_bytes: Vec<u8>,
     pub last_synced_ts: i64,
     pub state: NodeState,
 }
 
+impl ChatRecord {
+    pub fn server_id_hex(&self) -> String { id_key(self.server_id) }
+    pub fn chat_id_hex(&self) -> String { id_key(self.chat_id) }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
-    pub chat_id: String,
+    pub chat_id: u128,
     pub message_id: String,
     pub timestamp_ms: i64,
     pub text: String,
@@ -102,35 +116,37 @@ impl Store {
         Ok(Self { db })
     }
 
+    // ── Server ────────────────────────────────────────────────────────────────
+
     pub fn save_server_card(&self, card: &ServerCard) -> Result<()> {
-        let name = format!("{}-{}", card.id, address_hash(&card.address));
         let record = ServerRecord {
-            id: card.id.clone(),
-            name,
+            id: card.id,
+            name: card.name.clone(),
             address: card.address.clone(),
             shared_key_bytes: card.shared_key.clone(),
             admin_key_bytes: card.admin_key.clone(),
             state: NodeState::Disabled,
         };
         let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
-        table.put(&card.id, &record)?;
+        table.put(&id_key(card.id), &record)?;
         Ok(())
     }
 
-    pub fn export_server_card(&self, id: &str) -> Result<ServerCard> {
+    pub fn export_server_card(&self, id: u128) -> Result<ServerCard> {
         let r = self.load_server(id)?;
         Ok(ServerCard {
             id: r.id,
+            name: r.name,
             address: r.address,
             shared_key: r.shared_key_bytes,
             admin_key: r.admin_key_bytes,
         })
     }
 
-    pub fn load_server(&self, id: &str) -> Result<ServerRecord> {
+    pub fn load_server(&self, id: u128) -> Result<ServerRecord> {
         let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
-        table.get(&id.to_string())?
-            .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", id))
+        table.get(&id_key(id))?
+            .ok_or_else(|| anyhow::anyhow!("Server '{:032x}' not found", id))
     }
 
     pub fn list_servers(&self) -> Result<Vec<ServerRecord>> {
@@ -144,33 +160,35 @@ impl Store {
             .collect())
     }
 
-    pub fn set_server_state(&self, id: &str, state: NodeState) -> Result<()> {
+    pub fn set_server_state(&self, id: u128, state: NodeState) -> Result<()> {
         let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
         let mut record = self.load_server(id)?;
         record.state = state;
-        table.put(&id.to_string(), &record)?;
+        table.put(&id_key(id), &record)?;
         Ok(())
     }
 
-    pub fn rename_server(&self, id: &str, name: &str) -> Result<()> {
+    pub fn rename_server(&self, id: u128, name: &str) -> Result<()> {
         let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
         let mut record = self.load_server(id)?;
         record.name = name.to_string();
-        table.put(&id.to_string(), &record)?;
+        table.put(&id_key(id), &record)?;
         Ok(())
     }
 
-    pub fn delete_server(&self, id: &str) -> Result<()> {
+    pub fn delete_server(&self, id: u128) -> Result<()> {
         let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
-        table.delete(&id.to_string())?;
+        table.delete(&id_key(id))?;
         Ok(())
     }
+
+    // ── Chat ──────────────────────────────────────────────────────────────────
 
     pub fn save_chat_card(&self, card: &ChatCard) -> Result<()> {
-        let key = format!("{}:{}", card.server_id, card.chat_id);
+        let key = chat_key(card.server_id, card.chat_id);
         let record = ChatRecord {
-            server_id: card.server_id.clone(),
-            chat_id: card.chat_id.clone(),
+            server_id: card.server_id,
+            chat_id: card.chat_id,
             name: card.name.clone(),
             encryption_key_bytes: card.encryption_key.clone(),
             last_synced_ts: 0,
@@ -181,7 +199,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn export_chat_card(&self, server_id: &str, chat_id: &str) -> Result<ChatCard> {
+    pub fn export_chat_card(&self, server_id: u128, chat_id: u128) -> Result<ChatCard> {
         let r = self.load_chat(server_id, chat_id)?;
         Ok(ChatCard {
             server_id: r.server_id,
@@ -191,16 +209,16 @@ impl Store {
         })
     }
 
-    pub fn load_chat(&self, server_id: &str, chat_id: &str) -> Result<ChatRecord> {
-        let key = format!("{server_id}:{chat_id}");
+    pub fn load_chat(&self, server_id: u128, chat_id: u128) -> Result<ChatRecord> {
+        let key = chat_key(server_id, chat_id);
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         table.get(&key)?
             .ok_or_else(|| anyhow::anyhow!(
-                "Chat '{chat_id}' not found on server '{server_id}'"
+                "Chat '{:032x}' not found on server '{:032x}'", chat_id, server_id
             ))
     }
 
-    pub fn list_chats_for_server(&self, server_id: &str) -> Result<Vec<ChatRecord>> {
+    pub fn list_chats_for_server(&self, server_id: u128) -> Result<Vec<ChatRecord>> {
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         Ok(table.iter()?.into_iter()
             .filter(|(_, c)| c.server_id == server_id)
@@ -208,14 +226,14 @@ impl Store {
             .collect())
     }
 
-    pub fn list_enabled_chats_for_server(&self, server_id: &str) -> Result<Vec<ChatRecord>> {
+    pub fn list_enabled_chats_for_server(&self, server_id: u128) -> Result<Vec<ChatRecord>> {
         Ok(self.list_chats_for_server(server_id)?.into_iter()
             .filter(|c| c.state == NodeState::Enabled)
             .collect())
     }
 
-    pub fn set_chat_state(&self, server_id: &str, chat_id: &str, state: NodeState) -> Result<()> {
-        let key = format!("{server_id}:{chat_id}");
+    pub fn set_chat_state(&self, server_id: u128, chat_id: u128, state: NodeState) -> Result<()> {
+        let key = chat_key(server_id, chat_id);
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         let mut record = self.load_chat(server_id, chat_id)?;
         record.state = state;
@@ -223,8 +241,8 @@ impl Store {
         Ok(())
     }
 
-    pub fn rename_chat(&self, server_id: &str, chat_id: &str, name: &str) -> Result<()> {
-        let key = format!("{server_id}:{chat_id}");
+    pub fn rename_chat(&self, server_id: u128, chat_id: u128, name: &str) -> Result<()> {
+        let key = chat_key(server_id, chat_id);
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         let mut record = self.load_chat(server_id, chat_id)?;
         record.name = name.to_string();
@@ -232,15 +250,15 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete_chat(&self, server_id: &str, chat_id: &str) -> Result<()> {
-        let key = format!("{server_id}:{chat_id}");
+    pub fn delete_chat(&self, server_id: u128, chat_id: u128) -> Result<()> {
+        let key = chat_key(server_id, chat_id);
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         table.delete(&key)?;
         Ok(())
     }
 
-    pub fn update_chat_sync_ts(&self, server_id: &str, chat_id: &str, ts: i64) -> Result<()> {
-        let key = format!("{server_id}:{chat_id}");
+    pub fn update_chat_sync_ts(&self, server_id: u128, chat_id: u128, ts: i64) -> Result<()> {
+        let key = chat_key(server_id, chat_id);
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         let mut record = self.load_chat(server_id, chat_id)?;
         record.last_synced_ts = ts;
@@ -248,20 +266,24 @@ impl Store {
         Ok(())
     }
 
+    // ── Messages ──────────────────────────────────────────────────────────────
+
     pub fn save_message(&self, msg: &StoredMessage) -> Result<()> {
-        let table_name = format!("{}{}", MESSAGES_TABLE_PREFIX, msg.chat_id);
+        let table_name = msg_table_name(msg.chat_id);
         let table = self.db.table::<i64, StoredMessage>(&table_name)?;
         table.put(&msg.timestamp_ms, msg)?;
         Ok(())
     }
 
-    pub fn get_messages(&self, chat_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
-        let table_name = format!("{}{}", MESSAGES_TABLE_PREFIX, chat_id);
+    pub fn get_messages(&self, chat_id: u128, limit: usize) -> Result<Vec<StoredMessage>> {
+        let table_name = msg_table_name(chat_id);
         let table = self.db.table::<i64, StoredMessage>(&table_name)?;
         let all: Vec<StoredMessage> = table.iter()?.into_iter().map(|(_, v)| v).collect();
         let start = all.len().saturating_sub(limit);
         Ok(all[start..].to_vec())
     }
+
+    // ── Identity ──────────────────────────────────────────────────────────────
 
     pub fn set_identity_name(&self, name: &str) -> Result<()> {
         let table = self.db.table::<String, IdentityRecord>(IDENTITY_TABLE)?;
@@ -282,6 +304,8 @@ impl Store {
         let table = self.db.table::<String, IdentityRecord>(IDENTITY_TABLE)?;
         Ok(table.get(&"self".to_string())?)
     }
+
+    // ── Contacts ──────────────────────────────────────────────────────────────
 
     pub fn save_contact(&self, card: &ContactCard, name: Option<&str>) -> Result<()> {
         let id = card.id();
@@ -322,79 +346,83 @@ impl Store {
         Ok(())
     }
 
-    pub fn upsert_shared_server(&self, data: &ServerShareData) -> Result<String> {
-        let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
+    // ── Pending KEM offers (for manual share) ────────────────────────────────
 
-        let existing = table.get(&data.id)?.or_else(|| {
-            table.iter().ok().and_then(|all| {
-                all.into_iter()
-                    .find(|(_, r)| r.address == data.host)
-                    .map(|(_, r)| r)
-            })
-        });
-
-        if let Some(existing) = existing {
-            let admin_key = match (&existing.admin_key_bytes, &data.admin_key) {
-                (Some(ak), None) => Some(ak.clone()),
-                (_, incoming) => incoming.clone(),
-            };
-
-            let record = ServerRecord {
-                id: data.id.clone(),
-                name: existing.name.clone(),
-                address: data.host.clone(),
-                shared_key_bytes: data.shared_key.clone(),
-                admin_key_bytes: admin_key,
-                state: existing.state,
-            };
-
-            if existing.id != data.id {
-                table.delete(&existing.id)?;
-            }
-
-            table.put(&data.id, &record)?;
-            Ok(format!("Server '{}' updated", data.id))
-        } else {
-            let name = format!("{}-{}", data.id, address_hash(&data.host));
-            let record = ServerRecord {
-                id: data.id.clone(),
-                name,
-                address: data.host.clone(),
-                shared_key_bytes: data.shared_key.clone(),
-                admin_key_bytes: data.admin_key.clone(),
-                state: NodeState::Disabled,
-            };
-            table.put(&data.id, &record)?;
-            Ok(format!("Server '{}' saved", data.id))
-        }
+    pub fn save_pending_kem_offer(&self, contact_id: &str, kem_sk_bytes: &[u8]) -> Result<()> {
+        let table = self.db.table::<String, Vec<u8>>(PENDING_KEM_TABLE)?;
+        table.put(&contact_id.to_string(), &kem_sk_bytes.to_vec())?;
+        Ok(())
     }
 
-    pub fn upsert_shared_chat(&self, data: &ChatShareData) -> Result<String> {
-        let key = format!("{}:{}", data.server_id, data.chat_id);
+    pub fn take_pending_kem_offer(&self, contact_id: &str) -> Result<Vec<u8>> {
+        let table = self.db.table::<String, Vec<u8>>(PENDING_KEM_TABLE)?;
+        let sk = table.get(&contact_id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("No pending KEM offer for contact={}", contact_id))?;
+        table.delete(&contact_id.to_string())?;
+        Ok(sk)
+    }
+
+    // ── Share merge ───────────────────────────────────────────────────────────
+
+    /// Merge received server data: update admin_key if new, save if not present.
+    pub fn merge_server_share(&self, s: &ServerShareData) -> Result<String> {
+        let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
+
+        if let Some(existing) = table.get(&id_key(s.id))? {
+            if existing.address != s.host || existing.shared_key_bytes != s.shared_key {
+                anyhow::bail!(
+                    "Server {:032x} already exists but data mismatch (host or shared_key differs)",
+                    s.id
+                );
+            }
+            // Update admin_key only if we receive one and don't already have one
+            if s.admin_key.is_some() && existing.admin_key_bytes.is_none() {
+                let mut updated = existing.clone();
+                updated.admin_key_bytes = s.admin_key.clone();
+                table.put(&id_key(s.id), &updated)?;
+                return Ok(format!("Server '{:032x}' admin_key updated", s.id));
+            }
+            return Ok(format!("Server '{:032x}' already up to date", s.id));
+        }
+
+        let record = ServerRecord {
+            id: s.id,
+            name: s.name.clone(),
+            address: s.host.clone(),
+            shared_key_bytes: s.shared_key.clone(),
+            admin_key_bytes: s.admin_key.clone(),
+            state: NodeState::Disabled,
+        };
+        table.put(&id_key(s.id), &record)?;
+        Ok(format!("Server '{:032x}' saved", s.id))
+    }
+
+    pub fn merge_chat_share(&self, c: &ChatShareData) -> Result<String> {
+        // Always process server data first
+        self.merge_server_share(&c.server)?;
+
+        let key = chat_key(c.server.id, c.id);
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         let existing = table.get(&key)?;
 
         let record = ChatRecord {
-            server_id: data.server_id.clone(),
-            chat_id: data.chat_id.clone(),
-            name: data.name.clone(),
-            encryption_key_bytes: data.encryption_key.clone(),
+            server_id: c.server.id,
+            chat_id: c.id,
+            name: c.name.clone(),
+            encryption_key_bytes: c.encryption_key.clone(),
             last_synced_ts: existing.as_ref().map(|e| e.last_synced_ts).unwrap_or(0),
             state: existing.as_ref().map(|e| e.state).unwrap_or(NodeState::Disabled),
         };
         table.put(&key, &record)?;
 
-        if let Some(admin_key) = &data.server_admin_key {
-            let server_table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
-            if let Ok(Some(mut server)) = server_table.get(&data.server_id) {
-                if server.admin_key_bytes.is_none() {
-                    server.admin_key_bytes = Some(admin_key.clone());
-                    server_table.put(&data.server_id, &server)?;
-                }
-            }
-        }
-
         let action = if existing.is_some() { "updated" } else { "saved" };
-        Ok(format!("Chat '{}/{}' {action}", data.server_id, data.chat_id))
+        Ok(format!("Chat '{:032x}/{:032x}' {action}", c.server.id, c.id))
+    }
+
+    pub fn merge_share_data(&self, data: &crate::sharing::ShareData) -> Result<String> {
+        match data {
+            crate::sharing::ShareData::Server(s) => self.merge_server_share(s),
+            crate::sharing::ShareData::Chat(c) => self.merge_chat_share(c),
+        }
     }
 }

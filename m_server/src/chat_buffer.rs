@@ -10,7 +10,8 @@ pub struct StoredMessage {
 }
 
 pub struct ChatBuffer {
-    pub chat_id: String,
+    pub chat_id: u128,
+    pub name: String,
     pub max_messages: u32,
     pub max_bytes: u64,
     messages: VecDeque<StoredMessage>,
@@ -19,9 +20,10 @@ pub struct ChatBuffer {
 }
 
 impl ChatBuffer {
-    pub fn new(chat_id: String, max_messages: u32, max_bytes: u64, dedup_cache_size: usize) -> Self {
+    pub fn new(chat_id: u128, name: String, max_messages: u32, max_bytes: u64, dedup_cache_size: usize) -> Self {
         Self {
             chat_id,
+            name,
             max_messages,
             max_bytes,
             messages: VecDeque::new(),
@@ -30,10 +32,10 @@ impl ChatBuffer {
         }
     }
 
-    /// Возвращает (timestamp_ms, is_new)
+    /// Returns (timestamp_ms, is_new)
     pub fn push(&mut self, message_id: String, encrypted_payload: Vec<u8>) -> (i64, bool) {
         if let Some(&existing_ts) = self.seen_ids.get(&message_id) {
-            m_core::log_debug!("chat_buffer: push dedup hit chat={} message_id={} original_ts={}", self.chat_id, message_id, existing_ts);
+            m_core::log_debug!("chat_buffer: push dedup hit chat={:032x} message_id={} original_ts={}", self.chat_id, message_id, existing_ts);
             return (existing_ts, false);
         }
 
@@ -48,7 +50,7 @@ impl ChatBuffer {
 
         self.current_bytes += size;
         self.seen_ids.put(message_id.clone(), ts);
-        m_core::log_debug!("chat_buffer: push accepted chat={} message_id={} ts={} payload_bytes={} count={}", self.chat_id, message_id, ts, size, self.messages.len());
+        m_core::log_debug!("chat_buffer: push accepted chat={:032x} message_id={} ts={} payload_bytes={} count={}", self.chat_id, message_id, ts, size, self.messages.len());
         self.evict();
 
         (ts, true)
@@ -65,7 +67,7 @@ impl ChatBuffer {
         }
         let evicted = before_count - self.messages.len();
         if evicted > 0 {
-            m_core::log_warn!("chat_buffer: evict chat={} evicted_count={} freed_bytes={} remaining_count={} remaining_bytes={}", self.chat_id, evicted, before_bytes - self.current_bytes, self.messages.len(), self.current_bytes);
+            m_core::log_warn!("chat_buffer: evict chat={:032x} evicted_count={} freed_bytes={} remaining_count={} remaining_bytes={}", self.chat_id, evicted, before_bytes - self.current_bytes, self.messages.len(), self.current_bytes);
         }
     }
 

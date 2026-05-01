@@ -2,35 +2,42 @@ use serde::{Serialize, Deserialize};
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// Step 1 (Tor only): A → B — proves A's intent to share
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InviteMsg {
-    pub contact_id: String,
-    pub kem_pk: Vec<u8>,
-    pub signature: Vec<u8>,
+    pub user_id: String,
+    pub random_bytes: Vec<u8>, // 32 random bytes
+    pub signature: Vec<u8>,    // sign(random_bytes)
 }
 
+/// Step 2 (Tor) / init file (manual): B → A — B's ephemeral KEM public key
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct InviteAck {
-    pub contact_id: String,
-    pub kem_ct: Vec<u8>,
-    pub signature: Vec<u8>,
+pub struct KemOffer {
+    pub user_id: String,
+    pub kem_pk: Vec<u8>,    // ephemeral Kyber512 public key
+    pub signature: Vec<u8>, // sign(kem_pk)
 }
 
+/// Step 3 (Tor) / response file (manual): A → B — encrypted share data
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SharePayload {
-    pub ciphertext: Vec<u8>,
+pub struct SharePacket {
+    pub user_id: String,
+    pub kem_ct: Vec<u8>,     // Kyber512 ciphertext from encapsulate(B.kem_pk)
+    pub ciphertext: Vec<u8>, // AES-256-GCM(ShareData)
     pub nonce: Vec<u8>,
+    pub signature: Vec<u8>,  // sign(kem_ct || ciphertext || nonce)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ShareData {
     Server(ServerShareData),
-    Chat(ChatShareData),
+    Chat(ChatShareData), // always includes full server data
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerShareData {
-    pub id: String,
+    pub id: u128,
+    pub name: String,
     pub host: String,
     pub shared_key: Vec<u8>,
     pub admin_key: Option<Vec<u8>>,
@@ -38,11 +45,10 @@ pub struct ServerShareData {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatShareData {
-    pub server_id: String,
-    pub chat_id: String,
+    pub id: u128,
     pub name: String,
+    pub server: ServerShareData, // full server data always included
     pub encryption_key: Vec<u8>,
-    pub server_admin_key: Option<Vec<u8>>,
 }
 
 impl ShareData {

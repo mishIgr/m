@@ -9,6 +9,7 @@ use crate::config::DeliveryConfig;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatMeta {
+    pub name: String,
     pub max_messages: u32,
     pub max_bytes: u64,
 }
@@ -21,18 +22,28 @@ pub struct PendingAck {
 
 pub struct ConnectionState {
     pub stream_tx: mpsc::Sender<ServerEvent>,
-    pub subscribed_chats: HashSet<String>,
-    pub pending_acks: HashMap<(String, i64), PendingAck>,
+    pub subscribed_chats: HashSet<u128>,
+    pub pending_acks: HashMap<(u128, i64), PendingAck>,
 }
 
 pub struct Dispatcher {
-    pub chat_buffers: HashMap<String, ChatBuffer>,
-    pub subscriptions: HashMap<String, HashSet<u64>>,
+    pub chat_buffers: HashMap<u128, ChatBuffer>,
+    pub subscriptions: HashMap<u128, HashSet<u64>>,
     pub connections: HashMap<u64, ConnectionState>,
     next_conn_id: u64,
     delivery_config: DeliveryConfig,
     dedup_cache_size: usize,
     chats_table: RedbTable<String, ChatMeta>,
+}
+
+fn u128_key(id: u128) -> String {
+    format!("{:032x}", id)
+}
+
+pub fn bytes_to_u128(b: &[u8]) -> anyhow::Result<u128> {
+    let arr: [u8; 16] = b.try_into()
+        .map_err(|_| anyhow::anyhow!("chat_id must be 16 bytes, got {}", b.len()))?;
+    Ok(u128::from_be_bytes(arr))
 }
 
 impl Dispatcher {
@@ -42,11 +53,12 @@ impl Dispatcher {
         chats_table: RedbTable<String, ChatMeta>,
     ) -> Result<Self, m_core::db::KvError> {
         let mut chat_buffers = HashMap::new();
-        for (chat_id, meta) in chats_table.iter()? {
-            m_core::log_info!("Restored chat: {}", chat_id);
+        for (key, meta) in chats_table.iter()? {
+            let chat_id = u128::from_str_radix(&key, 16).unwrap_or(0);
+            m_core::log_info!("Restored chat: {:032x} name={}", chat_id, meta.name);
             chat_buffers.insert(
-                chat_id.clone(),
-                ChatBuffer::new(chat_id, meta.max_messages, meta.max_bytes, dedup_cache_size),
+                chat_id,
+                ChatBuffer::new(chat_id, meta.name.clone(), meta.max_messages, meta.max_bytes, dedup_cache_size),
             );
         }
         Ok(Self {
@@ -62,30 +74,31 @@ impl Dispatcher {
 
     pub fn create_chat(
         &mut self,
-        chat_id: &str,
+        chat_id: u128,
+        name: &str,
         max_messages: u32,
         max_bytes: u64,
     ) -> Result<bool, m_core::db::KvError> {
-        if self.chat_buffers.contains_key(chat_id) {
+        if self.chat_buffers.contains_key(&chat_id) {
             return Ok(false);
         }
-        let meta = ChatMeta { max_messages, max_bytes };
-        self.chats_table.put(&chat_id.to_string(), &meta)?;
+        let meta = ChatMeta { name: name.to_string(), max_messages, max_bytes };
+        self.chats_table.put(&u128_key(chat_id), &meta)?;
         self.chat_buffers.insert(
-            chat_id.to_string(),
-            ChatBuffer::new(chat_id.to_string(), max_messages, max_bytes, self.dedup_cache_size),
+            chat_id,
+            ChatBuffer::new(chat_id, name.to_string(), max_messages, max_bytes, self.dedup_cache_size),
         );
-        m_core::log_info!("Chat created: {}", chat_id);
+        m_core::log_info!("Chat created: {:032x} name={}", chat_id, name);
         Ok(true)
     }
 
-    pub fn delete_chat(&mut self, chat_id: &str) -> Result<bool, m_core::db::KvError> {
-        if self.chat_buffers.remove(chat_id).is_none() {
+    pub fn delete_chat(&mut self, chat_id: u128) -> Result<bool, m_core::db::KvError> {
+        if self.chat_buffers.remove(&chat_id).is_none() {
             return Ok(false);
         }
-        self.chats_table.delete(&chat_id.to_string())?;
-        self.subscriptions.remove(chat_id);
-        m_core::log_info!("Chat deleted: {}", chat_id);
+        self.chats_table.delete(&u128_key(chat_id))?;
+        self.subscriptions.remove(&chat_id);
+        m_core::log_info!("Chat deleted: {:032x}", chat_id);
         Ok(true)
     }
 
@@ -93,7 +106,8 @@ impl Dispatcher {
         self.chat_buffers
             .values()
             .map(|buf| ChatInfo {
-                chat_id: buf.chat_id.clone(),
+                chat_id: buf.chat_id.to_be_bytes().to_vec(),
+                name: buf.name.clone(),
                 latest_timestamp_ms: buf.latest_timestamp_ms(),
                 earliest_timestamp_ms: buf.earliest_timestamp_ms(),
             })
@@ -129,40 +143,48 @@ impl Dispatcher {
 
     pub async fn subscribe(&mut self, conn_id: u64, chats: Vec<ChatSubscription>) {
         for chat in chats {
-            self.add_subscription(conn_id, &chat.chat_id, chat.latest_timestamp_ms as i64).await;
+            let chat_id = match bytes_to_u128(&chat.chat_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    m_core::log_warn!("dispatcher: subscribe invalid chat_id conn={}: {}", conn_id, e);
+                    continue;
+                }
+            };
+            self.add_subscription(conn_id, chat_id, chat.latest_timestamp_ms as i64).await;
         }
     }
 
-    async fn add_subscription(&mut self, conn_id: u64, chat_id: &str, last_ts: i64) {
-        let Some(buffer) = self.chat_buffers.get(chat_id) else {
-            m_core::log_warn!("dispatcher: add_subscription chat not found conn={} chat={}", conn_id, chat_id);
+    async fn add_subscription(&mut self, conn_id: u64, chat_id: u128, last_ts: i64) {
+        let Some(buffer) = self.chat_buffers.get(&chat_id) else {
+            m_core::log_warn!("dispatcher: add_subscription chat not found conn={} chat={:032x}", conn_id, chat_id);
             return;
         };
 
         let messages: Vec<_> = buffer.get_after(last_ts).into_iter().cloned().collect();
         let latest = buffer.latest_timestamp_ms();
-        m_core::log_debug!("dispatcher: add_subscription conn={} chat={} last_ts={} catchup_count={} latest_ts={}", conn_id, chat_id, last_ts, messages.len(), latest);
+        let chat_id_bytes = chat_id.to_be_bytes().to_vec();
+        m_core::log_debug!("dispatcher: add_subscription conn={} chat={:032x} last_ts={} catchup_count={} latest_ts={}", conn_id, chat_id, last_ts, messages.len(), latest);
 
         self.subscriptions
-            .entry(chat_id.to_string())
+            .entry(chat_id)
             .or_default()
             .insert(conn_id);
 
         let Some(conn) = self.connections.get_mut(&conn_id) else { return };
-        conn.subscribed_chats.insert(chat_id.to_string());
+        conn.subscribed_chats.insert(chat_id);
 
         let timeout = Duration::from_secs(self.delivery_config.ack_timeout_secs);
 
         for msg in messages {
             let chat_msg = ChatMessage {
-                chat_id: chat_id.to_string(),
+                chat_id: chat_id_bytes.clone(),
                 message_id: msg.message_id.clone(),
                 timestamp_ms: msg.timestamp_ms,
                 encrypted_payload: msg.encrypted_payload.clone(),
             };
 
             conn.pending_acks.insert(
-                (chat_id.to_string(), msg.timestamp_ms),
+                (chat_id, msg.timestamp_ms),
                 PendingAck {
                     message: chat_msg.clone(),
                     attempts: 1,
@@ -173,28 +195,28 @@ impl Dispatcher {
             if let Err(e) = conn.stream_tx.send(ServerEvent {
                 event: Some(server_event::Event::Message(chat_msg)),
             }).await {
-                m_core::log_warn!("dispatcher: add_subscription send failed conn={} chat={} ts={}: {}", conn_id, chat_id, msg.timestamp_ms, e);
+                m_core::log_warn!("dispatcher: add_subscription send failed conn={} chat={:032x} ts={}: {}", conn_id, chat_id, msg.timestamp_ms, e);
             }
         }
 
         if let Err(e) = conn.stream_tx.send(ServerEvent {
             event: Some(server_event::Event::SyncComplete(SyncComplete {
-                chat_id: chat_id.to_string(),
+                chat_id: chat_id_bytes,
                 synced_up_timestamp_ms: latest,
             })),
         }).await {
-            m_core::log_warn!("dispatcher: add_subscription SyncComplete send failed conn={} chat={}: {}", conn_id, chat_id, e);
+            m_core::log_warn!("dispatcher: add_subscription SyncComplete send failed conn={} chat={:032x}: {}", conn_id, chat_id, e);
         } else {
-            m_core::log_debug!("dispatcher: add_subscription SyncComplete sent conn={} chat={} latest_ts={}", conn_id, chat_id, latest);
+            m_core::log_debug!("dispatcher: add_subscription SyncComplete sent conn={} chat={:032x} latest_ts={}", conn_id, chat_id, latest);
         }
     }
 
-    pub async fn fanout(&mut self, chat_id: &str, message: &ChatMessage) {
+    pub async fn fanout(&mut self, chat_id: u128, message: &ChatMessage) {
         let conn_ids: Vec<u64> = self.subscriptions
-            .get(chat_id)
+            .get(&chat_id)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
-        m_core::log_debug!("dispatcher: fanout chat={} subscriber_count={} msg_ts={} msg_id={}", chat_id, conn_ids.len(), message.timestamp_ms, message.message_id);
+        m_core::log_debug!("dispatcher: fanout chat={:032x} subscriber_count={} msg_ts={} msg_id={}", chat_id, conn_ids.len(), message.timestamp_ms, message.message_id);
 
         let timeout = Duration::from_secs(self.delivery_config.ack_timeout_secs);
 
@@ -202,7 +224,7 @@ impl Dispatcher {
             let Some(conn) = self.connections.get_mut(&conn_id) else { continue };
 
             conn.pending_acks.insert(
-                (chat_id.to_string(), message.timestamp_ms),
+                (chat_id, message.timestamp_ms),
                 PendingAck {
                     message: message.clone(),
                     attempts: 1,
@@ -213,21 +235,28 @@ impl Dispatcher {
             if let Err(e) = conn.stream_tx.send(ServerEvent {
                 event: Some(server_event::Event::Message(message.clone())),
             }).await {
-                m_core::log_warn!("dispatcher: fanout send failed conn={} chat={} ts={}: {}", conn_id, chat_id, message.timestamp_ms, e);
+                m_core::log_warn!("dispatcher: fanout send failed conn={} chat={:032x} ts={}: {}", conn_id, chat_id, message.timestamp_ms, e);
             }
         }
     }
 
     pub fn handle_ack(&mut self, conn_id: u64, ack: &MessageAck) {
+        let chat_id = match bytes_to_u128(&ack.chat_id) {
+            Ok(id) => id,
+            Err(e) => {
+                m_core::log_warn!("dispatcher: handle_ack invalid chat_id conn={}: {}", conn_id, e);
+                return;
+            }
+        };
         if let Some(conn) = self.connections.get_mut(&conn_id) {
-            let key = (ack.chat_id.clone(), ack.timestamp_ms as i64);
+            let key = (chat_id, ack.timestamp_ms as i64);
             if conn.pending_acks.remove(&key).is_some() {
-                m_core::log_debug!("dispatcher: handle_ack matched conn={} chat={} ts={}", conn_id, ack.chat_id, ack.timestamp_ms);
+                m_core::log_debug!("dispatcher: handle_ack matched conn={} chat={:032x} ts={}", conn_id, chat_id, ack.timestamp_ms);
             } else {
-                m_core::log_warn!("dispatcher: handle_ack NOT FOUND conn={} chat={} ts={} (duplicate or mismatch)", conn_id, ack.chat_id, ack.timestamp_ms);
+                m_core::log_warn!("dispatcher: handle_ack NOT FOUND conn={} chat={:032x} ts={} (duplicate or mismatch)", conn_id, chat_id, ack.timestamp_ms);
             }
         } else {
-            m_core::log_warn!("dispatcher: handle_ack unknown conn={} chat={} ts={}", conn_id, ack.chat_id, ack.timestamp_ms);
+            m_core::log_warn!("dispatcher: handle_ack unknown conn={} chat={:032x} ts={}", conn_id, chat_id, ack.timestamp_ms);
         }
     }
 
@@ -247,7 +276,7 @@ impl Dispatcher {
                 if now < pending.next_retry_at { continue; }
 
                 if pending.attempts >= max_retries {
-                    m_core::log_warn!("Max retries: conn={} chat={} ts={}", conn_id, key.0, key.1);
+                    m_core::log_warn!("Max retries: conn={} chat={:032x} ts={}", conn_id, key.0, key.1);
                     to_remove.push(key.clone());
                     continue;
                 }
@@ -258,9 +287,9 @@ impl Dispatcher {
                 if let Err(e) = tx.send(ServerEvent {
                     event: Some(server_event::Event::Message(pending.message.clone())),
                 }).await {
-                    m_core::log_warn!("dispatcher: retry_pending send failed conn={} chat={} ts={} attempt={}: {}", conn_id, key.0, key.1, pending.attempts, e);
+                    m_core::log_warn!("dispatcher: retry_pending send failed conn={} chat={:032x} ts={} attempt={}: {}", conn_id, key.0, key.1, pending.attempts, e);
                 } else {
-                    m_core::log_debug!("dispatcher: retry_pending sent conn={} chat={} ts={} attempt={}", conn_id, key.0, key.1, pending.attempts);
+                    m_core::log_debug!("dispatcher: retry_pending sent conn={} chat={:032x} ts={} attempt={}", conn_id, key.0, key.1, pending.attempts);
                 }
             }
 

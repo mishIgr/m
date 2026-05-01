@@ -14,7 +14,7 @@ use m_core::crypto::algorithms::symmetric::Aes256Gcm;
 use m_core::crypto::key::Key;
 
 use crate::sharing::{
-    InviteMsg, InviteAck, SharePayload, ShareData,
+    InviteMsg, KemOffer, SharePacket, ShareData,
     encode_frame, decode_frame,
 };
 use crate::live::LiveEvent;
@@ -33,11 +33,6 @@ fn parse_bootstrap_pct(line: &str) -> Option<u8> {
     rest[..end].trim().parse().ok()
 }
 
-/// Ensure a Tor process is available on `TOR_CONTROL_PORT`.
-///
-/// If Tor is already running (another client on the same machine), returns `Ok(None)`.
-/// Otherwise spawns a subprocess, waits for full bootstrap, and returns `Ok(Some(child))`.
-/// Progress is sent as `LiveEvent::TorBootstrap` events through `event_tx`.
 pub async fn spawn_tor(
     event_tx: &mpsc::UnboundedSender<LiveEvent>,
 ) -> Result<Option<tokio::process::Child>> {
@@ -116,6 +111,11 @@ fn build_verifier(contact: &ContactRecord) -> Result<Key<{ Dilithium2::PUBLIC_KE
         .map_err(|e| anyhow::anyhow!("bad contact signing pk: {e}"))
 }
 
+/// Concatenate slices for signing.
+fn concat_for_sign(parts: &[&[u8]]) -> Vec<u8> {
+    parts.iter().flat_map(|s| s.iter().copied()).collect()
+}
+
 async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.context("read frame length")?;
@@ -135,10 +135,6 @@ async fn write_frame(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
 }
 
 /// Start a Tor hidden service listener.
-/// Spawns a `tor` subprocess, registers the onion service, and accepts incoming connections.
-/// Returns the onion address and an optional tor `Child` handle.
-/// The handle is `Some` only if this call spawned the subprocess;
-/// `None` means an existing Tor was reused and must not be killed on stop.
 pub async fn listen(
     port: u16,
     store: Store,
@@ -202,7 +198,7 @@ pub async fn listen(
                     tokio::spawn(async move {
                         if let Err(e) = handle_incoming(stream, &store, &identity, &event_tx).await {
                             let _ = event_tx.send(LiveEvent::Error {
-                                server_id: "share".into(),
+                                server_id: 0,
                                 message: format!("share recv error: {e}"),
                             });
                         }
@@ -215,50 +211,64 @@ pub async fn listen(
     Ok((addr_string, tor_child))
 }
 
+/// Receiver side of the Tor sharing protocol.
+///
+/// Protocol:
+///   Step 1: read InviteMsg from A (proves A's intent, verifies A is known contact)
+///   Step 2: generate ephemeral KEM keypair, sign (offer_id || kem_pk), send KemOffer to A
+///   Step 3: read SharePacket from A, verify signature, decapsulate → shared_secret, decrypt data
 async fn handle_incoming(
     mut stream: TcpStream,
     store: &Store,
     identity: &IdentityRecord,
     event_tx: &mpsc::UnboundedSender<LiveEvent>,
 ) -> Result<()> {
-    // Step 1: read InviteMsg
+    // Step 1: read InviteMsg from A
     let frame = read_frame(&mut stream).await?;
     let invite: InviteMsg = decode_frame(&frame)?;
 
-    let contact = store.load_contact(&invite.contact_id)
-        .with_context(|| format!("unknown contact: {}", invite.contact_id))?;
+    let contact = store.load_contact(&invite.user_id)
+        .with_context(|| format!("unknown contact: {}", invite.user_id))?;
 
     let contact_pk = build_verifier(&contact)?;
-    let valid = Dilithium2::verify(&contact_pk, &invite.kem_pk, &invite.signature)
+    let valid = Dilithium2::verify(&contact_pk, &invite.random_bytes, &invite.signature)
         .map_err(|e| anyhow::anyhow!("signature verify: {e}"))?;
     if !valid {
-        anyhow::bail!("invalid signature from {}", invite.contact_id);
+        anyhow::bail!("invalid invite signature from {}", invite.user_id);
     }
 
-    // Step 2: encapsulate + send InviteAck
-    let kem_pk: Key<{ Kyber512::PUBLIC_KEY_SIZE }> = CryptoKey::from_bytes(&invite.kem_pk)
-        .map_err(|e| anyhow::anyhow!("bad KEM pk: {e}"))?;
-    let (shared_secret, kem_ct) = Kyber512::encapsulate(&kem_pk)
-        .map_err(|e| anyhow::anyhow!("encapsulate: {e}"))?;
+    // Step 2: generate ephemeral KEM keypair, create KemOffer, sign, send
+    let kyber = Kyber512::new();
+    let kem_pk_bytes = kyber.get_public().as_bytes().to_vec();
 
     let signer = build_signer(identity)?;
-    let ct_sig = signer.sign(&kem_ct)
-        .map_err(|e| anyhow::anyhow!("sign: {e}"))?;
+    let offer_sig = signer.sign(&kem_pk_bytes)
+        .map_err(|e| anyhow::anyhow!("sign offer: {e}"))?;
 
-    let ack = InviteAck {
-        contact_id: identity.id.clone(),
-        kem_ct,
-        signature: ct_sig,
+    let kem_offer = KemOffer {
+        user_id: identity.id.clone(),
+        kem_pk: kem_pk_bytes,
+        signature: offer_sig,
     };
-    let ack_frame = encode_frame(&ack)?;
-    write_frame(&mut stream, &ack_frame).await?;
+    let offer_frame = encode_frame(&kem_offer)?;
+    write_frame(&mut stream, &offer_frame).await?;
 
-    // Step 3: read SharePayload and decrypt
-    let payload_frame = read_frame(&mut stream).await?;
-    let payload: SharePayload = decode_frame(&payload_frame)?;
+    // Step 3: read SharePacket from A
+    let packet_frame = read_frame(&mut stream).await?;
+    let packet: SharePacket = decode_frame(&packet_frame)?;
+
+    let packet_sign_msg = concat_for_sign(&[&packet.kem_ct, &packet.ciphertext, &packet.nonce]);
+    let valid = Dilithium2::verify(&contact_pk, &packet_sign_msg, &packet.signature)
+        .map_err(|e| anyhow::anyhow!("verify packet: {e}"))?;
+    if !valid {
+        anyhow::bail!("invalid packet signature from {}", packet.user_id);
+    }
+
+    let shared_secret = kyber.decapsulate(&packet.kem_ct)
+        .map_err(|e| anyhow::anyhow!("decapsulate: {e}"))?;
 
     let cipher = derive_aes_key(shared_secret.as_bytes())?;
-    let plaintext = cipher.decrypt(&payload.nonce, &payload.ciphertext, b"share")
+    let plaintext = cipher.decrypt(&packet.nonce, &packet.ciphertext, b"share")
         .map_err(|e| anyhow::anyhow!("decrypt share: {e}"))?;
     let data = ShareData::from_bytes(&plaintext)?;
 
@@ -266,7 +276,12 @@ async fn handle_incoming(
     Ok(())
 }
 
-/// Send share data to a contact's onion address.
+/// Sender side of the Tor sharing protocol.
+///
+/// Protocol:
+///   Step 1: generate 32 random bytes, sign, send InviteMsg to B
+///   Step 2: read KemOffer from B, verify signature
+///   Step 3: encapsulate B's kem_pk → (shared_secret, kem_ct), encrypt data, sign, send SharePacket
 pub async fn send_share(
     data: ShareData,
     contact: &ContactRecord,
@@ -282,46 +297,56 @@ pub async fn send_share(
 
     let mut stream = socks_stream.into_inner();
 
-    // Step 1: generate ephemeral KEM keypair, sign pk, send InviteMsg
-    let kyber = Kyber512::new();
-    let kem_pk_bytes = kyber.get_public().as_bytes().to_vec();
-
+    // Step 1: generate random invite, sign, send InviteMsg
+    let random_bytes: Vec<u8> = rand::random::<[u8; 32]>().to_vec();
     let signer = build_signer(identity)?;
-    let pk_sig = signer.sign(&kem_pk_bytes)
-        .map_err(|e| anyhow::anyhow!("sign: {e}"))?;
+    let invite_sig = signer.sign(&random_bytes)
+        .map_err(|e| anyhow::anyhow!("sign invite: {e}"))?;
 
     let invite = InviteMsg {
-        contact_id: identity.id.clone(),
-        kem_pk: kem_pk_bytes,
-        signature: pk_sig,
+        user_id: identity.id.clone(),
+        random_bytes,
+        signature: invite_sig,
     };
     let invite_frame = encode_frame(&invite)?;
     write_frame(&mut stream, &invite_frame).await?;
 
-    // Step 2: read InviteAck, verify, decapsulate
-    let ack_frame = read_frame(&mut stream).await?;
-    let ack: InviteAck = decode_frame(&ack_frame)?;
+    // Step 2: read KemOffer from B, verify
+    let offer_frame = read_frame(&mut stream).await?;
+    let kem_offer: KemOffer = decode_frame(&offer_frame)?;
 
     let contact_pk = build_verifier(contact)?;
-    let valid = Dilithium2::verify(&contact_pk, &ack.kem_ct, &ack.signature)
-        .map_err(|e| anyhow::anyhow!("verify ack: {e}"))?;
+    let valid = Dilithium2::verify(&contact_pk, &kem_offer.kem_pk, &kem_offer.signature)
+        .map_err(|e| anyhow::anyhow!("verify offer: {e}"))?;
     if !valid {
-        anyhow::bail!("invalid ack signature from {}", ack.contact_id);
+        anyhow::bail!("invalid KemOffer signature from {}", kem_offer.user_id);
     }
 
-    let shared_secret = kyber.decapsulate(&ack.kem_ct)
-        .map_err(|e| anyhow::anyhow!("decapsulate: {e}"))?;
+    // Step 3: encapsulate, encrypt, sign, send SharePacket
+    let kem_pk: Key<{ Kyber512::PUBLIC_KEY_SIZE }> = CryptoKey::from_bytes(&kem_offer.kem_pk)
+        .map_err(|e| anyhow::anyhow!("bad KEM pk: {e}"))?;
+    let (shared_secret, kem_ct) = Kyber512::encapsulate(&kem_pk)
+        .map_err(|e| anyhow::anyhow!("encapsulate: {e}"))?;
 
-    // Step 3: encrypt ShareData and send SharePayload
     let plaintext = data.to_bytes()?;
     let cipher = derive_aes_key(shared_secret.as_bytes())?;
     let nonce = Aes256Gcm::generate_nonce();
     let ciphertext = cipher.encrypt(&nonce, &plaintext, b"share")
         .map_err(|e| anyhow::anyhow!("encrypt share: {e}"))?;
 
-    let payload = SharePayload { ciphertext, nonce };
-    let payload_frame = encode_frame(&payload)?;
-    write_frame(&mut stream, &payload_frame).await?;
+    let packet_sign_msg = concat_for_sign(&[&kem_ct, &ciphertext, &nonce]);
+    let packet_sig = signer.sign(&packet_sign_msg)
+        .map_err(|e| anyhow::anyhow!("sign packet: {e}"))?;
+
+    let packet = SharePacket {
+        user_id: identity.id.clone(),
+        kem_ct,
+        ciphertext,
+        nonce,
+        signature: packet_sig,
+    };
+    let packet_frame = encode_frame(&packet)?;
+    write_frame(&mut stream, &packet_frame).await?;
 
     Ok(())
 }

@@ -16,7 +16,7 @@ service Messenger {
 
 message CreateChatRequest {
     bytes admin_key = 1;
-    string chat_id = 2;
+    string name = 2;
     uint32 max_messages = 3;
     uint64 max_bytes = 4;
 }
@@ -24,11 +24,12 @@ message CreateChatRequest {
 message CreateChatResponse {
     bool success = 1;
     string error = 2;
+    bytes chat_id = 3;
 }
 
 message DeleteChatRequest {
     bytes admin_key = 1;
-    string chat_id = 2;
+    bytes chat_id = 2;
 }
 
 message DeleteChatResponse {
@@ -45,14 +46,14 @@ message ListChatsResponse {
 }
 
 message ChatInfo {
-    string chat_id = 1;
-    uint64 latest_timestamp_ms = 2;
-    uint64 earliest_timestamp_ms = 3;
+    bytes chat_id = 1;
+    string name = 2;
+    uint64 latest_timestamp_ms = 3;
+    uint64 earliest_timestamp_ms = 4;
 }
 
 message SendMessageRequest {
-    string chat_id = 1;
-    string message_id = 2;
+    bytes chat_id = 1;
     bytes encrypted_payload = 3;
 }
 
@@ -60,10 +61,11 @@ message SendMessageResponse {
     bool accepted = 1;
     uint64 timestamp_ms = 2;
     string error = 3;
+    string message_id = 4;
 }
 
 message GetHistoryRequest {
-    string chat_id = 1;
+    bytes chat_id = 1;
     uint64 from_timestamp_ms = 2;
     uint64 to_timestamp_ms = 3;
     uint32 limit = 4;
@@ -85,12 +87,12 @@ message SubscribeRequest {
 }
 
 message ChatSubscription {
-    string chat_id = 1;
+    bytes chat_id = 1;
     uint64 latest_timestamp_ms = 2;
 }
 
 message MessageAck {
-    string chat_id = 1;
+    bytes chat_id = 1;
     uint64 timestamp_ms = 2;
 }
 
@@ -103,14 +105,14 @@ message ServerEvent {
 }
 
 message ChatMessage {
-    string chat_id = 1;
+    bytes chat_id = 1;
     string message_id = 2;
     int64 timestamp_ms = 3;
     bytes encrypted_payload = 4;
 }
 
 message SyncComplete {
-    string chat_id = 1;
+    bytes chat_id = 1;
     uint64 synced_up_timestamp_ms = 2;
 }
 

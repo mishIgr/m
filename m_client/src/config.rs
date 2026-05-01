@@ -32,13 +32,18 @@ impl ClientConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCard {
-    pub id: String,
+    pub id: u128,
+    pub name: String,
     pub address: String,
     pub shared_key: Vec<u8>,
     pub admin_key: Option<Vec<u8>>,
 }
 
 impl ServerCard {
+    pub fn id_hex(&self) -> String {
+        format!("{:032x}", self.id)
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         Ok(bincode::serialize(self)?)
     }
@@ -62,13 +67,21 @@ impl ServerCard {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCard {
-    pub server_id: String,
-    pub chat_id: String,
+    pub server_id: u128,
+    pub chat_id: u128,
     pub name: String,
     pub encryption_key: Vec<u8>,
 }
 
 impl ChatCard {
+    pub fn server_id_hex(&self) -> String {
+        format!("{:032x}", self.server_id)
+    }
+
+    pub fn chat_id_hex(&self) -> String {
+        format!("{:032x}", self.chat_id)
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         Ok(bincode::serialize(self)?)
     }
