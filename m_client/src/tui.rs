@@ -691,7 +691,7 @@ async fn exec_chats(
                     let ts = chrono::DateTime::from_timestamp_millis(msg.timestamp_ms)
                         .map(|dt| dt.format("%H:%M").to_string())
                         .unwrap_or_else(|| msg.timestamp_ms.to_string());
-                    let line = format!("[{ts}] {display}: {msg.text}");
+                    let line = format!("[{ts}] {display}: {}", msg.text);
                     push_with_date_sep(&mut initial, &mut last_date, msg.timestamp_ms, line);
                 }
             }

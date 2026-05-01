@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
             signing_pk_bytes: identity.signing.get_public().as_bytes().to_vec(),
             tor_sk_bytes: identity.tor_sk_bytes().to_vec(),
             tor_pk_bytes: identity.tor_pk_bytes().to_vec(),
+            name: None,
         };
         store.save_identity(&record)?;
         println!("Identity generated.");
