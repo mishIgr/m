@@ -2,12 +2,18 @@
 
 Encrypted TUI messenger over gRPC. Messages are encrypted end-to-end on the client; the server stores and routes ciphertext only.
 
-## Build
+## Install
 
 ```bash
-cargo build --release
-# binaries: target/release/m_server, target/release/m_client
+./prepare.sh          # release build (default)
+./prepare.sh --debug  # debug build
 ```
+
+Installs:
+- `m_client` → `~/.local/bin/m_client`
+- `m_server` → `~/.local/share/m/deploy/m_server`
+- Client config template → `~/.config/m/client.toml` (only if not already present)
+- Server config template → `~/.local/share/m/deploy/m_server.template.toml`
 
 ---
 
@@ -50,7 +56,7 @@ See [`config/server.toml`](config/server.toml) for a working example.
 ### Running
 
 ```bash
-./target/release/m_server config/server.toml
+~/.local/share/m/deploy/m_server ~/.config/m/server.toml
 ```
 
 ---
@@ -74,7 +80,7 @@ See [`config/client.toml`](config/client.toml) for an example.
 ### Running
 
 ```bash
-./target/release/m_client --config config/client.toml
+m_client
 ```
 
 ---
