@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rand::RngExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -298,7 +299,7 @@ pub async fn send_share(
     let mut stream = socks_stream.into_inner();
 
     // Step 1: generate random invite, sign, send InviteMsg
-    let random_bytes: Vec<u8> = rand::random::<[u8; 32]>().to_vec();
+    let random_bytes: Vec<u8> = rand::rng().random::<[u8; 32]>().to_vec();
     let signer = build_signer(identity)?;
     let invite_sig = signer.sign(&random_bytes)
         .map_err(|e| anyhow::anyhow!("sign invite: {e}"))?;

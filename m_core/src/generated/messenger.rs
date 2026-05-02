@@ -11,7 +11,7 @@ pub struct CreateChatRequest {
     #[prost(bytes = "vec", tag = "1")]
     pub admin_key: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "2")]
-    pub chat_id: ::prost::alloc::string::String,
+    pub name: ::prost::alloc::string::String,
     #[prost(uint32, tag = "3")]
     pub max_messages: u32,
     #[prost(uint64, tag = "4")]
@@ -24,14 +24,16 @@ pub struct CreateChatResponse {
     pub success: bool,
     #[prost(string, tag = "2")]
     pub error: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "3")]
+    pub chat_id: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteChatRequest {
     #[prost(bytes = "vec", tag = "1")]
     pub admin_key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(string, tag = "2")]
-    pub chat_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub chat_id: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -56,20 +58,20 @@ pub struct ListChatsResponse {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChatInfo {
-    #[prost(string, tag = "1")]
-    pub chat_id: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub latest_timestamp_ms: u64,
+    #[prost(bytes = "vec", tag = "1")]
+    pub chat_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
     #[prost(uint64, tag = "3")]
+    pub latest_timestamp_ms: u64,
+    #[prost(uint64, tag = "4")]
     pub earliest_timestamp_ms: u64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SendMessageRequest {
-    #[prost(string, tag = "1")]
-    pub chat_id: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub message_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "1")]
+    pub chat_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "3")]
     pub encrypted_payload: ::prost::alloc::vec::Vec<u8>,
 }
@@ -82,12 +84,14 @@ pub struct SendMessageResponse {
     pub timestamp_ms: u64,
     #[prost(string, tag = "3")]
     pub error: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub message_id: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetHistoryRequest {
-    #[prost(string, tag = "1")]
-    pub chat_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "1")]
+    pub chat_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint64, tag = "2")]
     pub from_timestamp_ms: u64,
     #[prost(uint64, tag = "3")]
@@ -127,16 +131,16 @@ pub struct SubscribeRequest {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChatSubscription {
-    #[prost(string, tag = "1")]
-    pub chat_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "1")]
+    pub chat_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint64, tag = "2")]
     pub latest_timestamp_ms: u64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MessageAck {
-    #[prost(string, tag = "1")]
-    pub chat_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "1")]
+    pub chat_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint64, tag = "2")]
     pub timestamp_ms: u64,
 }
@@ -162,8 +166,8 @@ pub mod server_event {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChatMessage {
-    #[prost(string, tag = "1")]
-    pub chat_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "1")]
+    pub chat_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "2")]
     pub message_id: ::prost::alloc::string::String,
     #[prost(int64, tag = "3")]
@@ -174,8 +178,8 @@ pub struct ChatMessage {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SyncComplete {
-    #[prost(string, tag = "1")]
-    pub chat_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "1")]
+    pub chat_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint64, tag = "2")]
     pub synced_up_timestamp_ms: u64,
 }

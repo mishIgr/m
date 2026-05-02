@@ -17,12 +17,15 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use m_core::crypto::AsymmetricCipher;
+use m_core::crypto::algorithms::signature::Dilithium2;
+
 use crate::config::{ServerCard, ChatCard};
 use crate::connection_manager::ConnectionManager;
 use crate::identity::ContactCard;
 use crate::live::LiveEvent;
-use crate::sharing::{ShareData, ChatShareData};
-use crate::store::{ContactRecord, ChatRecord, NodeState, ServerRecord, Store};
+use crate::sharing::{ShareData, ChatShareData, ServerShareData};
+use crate::store::{ContactRecord, ChatRecord, NodeState, ServerRecord, Store, VerificationStatus};
 use crate::transport::Transport;
 
 const MAX_MESSAGES: usize = 2000;
@@ -34,7 +37,7 @@ const MAX_RECEIVING_LINES: usize = 500;
 enum Screen {
     Contacts,
     Servers,
-    Chats { server_id: String },
+    Chats { server_id: u128 },
     Share,
 }
 
@@ -58,8 +61,8 @@ enum ShareStep {
 enum LiveMode {
     Off,
     On {
-        server_id: String,
-        chat_id: String,
+        server_id: u128,
+        chat_id: u128,
         messages: VecDeque<String>,
         scroll: u16,
         last_date: Option<String>,
@@ -163,7 +166,7 @@ fn refresh_servers(app: &mut App, store: &Store) {
     app.servers = store.list_servers().unwrap_or_default();
     app.servers_cursor = app.servers_cursor.min(app.servers.len().saturating_sub(1));
     app.servers_last_ts = app.servers.iter().map(|s| {
-        store.list_chats_for_server(&s.id).ok()
+        store.list_chats_for_server(s.id).ok()
             .and_then(|chats| {
                 chats.iter()
                     .filter(|c| c.state == NodeState::Enabled && c.last_synced_ts > 0)
@@ -174,7 +177,7 @@ fn refresh_servers(app: &mut App, store: &Store) {
 }
 
 fn refresh_chats(app: &mut App, store: &Store) {
-    if let Screen::Chats { server_id } = &app.screen.clone() {
+    if let Screen::Chats { server_id } = app.screen.clone() {
         app.chats = store.list_chats_for_server(server_id).unwrap_or_default();
         app.chats_cursor = app.chats_cursor.min(app.chats.len().saturating_sub(1));
     }
@@ -224,8 +227,7 @@ async fn execute_command(
         Screen::Contacts => exec_contacts(trimmed, &words, app, store).await,
         Screen::Servers  => exec_servers(trimmed, &words, app, store, manager, event_tx, share_state).await,
         Screen::Chats { server_id } => {
-            let sid = server_id.clone();
-            exec_chats(trimmed, &words, &sid, app, store, manager).await
+            exec_chats(trimmed, &words, *server_id, app, store, manager).await
         }
         Screen::Share => exec_share(trimmed, &words, app, store, event_tx, share_state).await,
     }
@@ -395,7 +397,7 @@ async fn exec_servers(
                 "  chats                  Go to chats of selected server".into(),
                 "  import <path>          Import server from binary file".into(),
                 "  export <path>          Export selected server to binary file".into(),
-                "  deploy <user> <ip> <pass>  Deploy server via SSH".into(),
+                "  deploy <user> <ip> <pass> <name>  Deploy server via SSH".into(),
                 "  remove <user> <ip> <pass>  Remove server via SSH".into(),
                 "  admin create-chat <id> Create chat on server, generate key, save locally".into(),
                 "  admin delete-chat <id> Delete chat on selected server".into(),
@@ -407,7 +409,7 @@ async fn exec_servers(
             if app.servers.is_empty() {
                 app.set_error("No servers"); return;
             }
-            let sid = app.servers[app.servers_cursor].id.clone();
+            let sid = app.servers[app.servers_cursor].id;
             app.screen = Screen::Chats { server_id: sid };
             app.chats_cursor = 0;
             refresh_chats(app, store);
@@ -416,11 +418,11 @@ async fn exec_servers(
             if app.servers.is_empty() {
                 app.set_error("No servers"); return;
             }
-            let id = app.servers[app.servers_cursor].id.clone();
-            if let Err(e) = store.set_server_state(&id, NodeState::Enabled) {
+            let id = app.servers[app.servers_cursor].id;
+            if let Err(e) = store.set_server_state(id, NodeState::Enabled) {
                 app.set_error(format!("Error: {e}")); return;
             }
-            if let Err(e) = manager.start_server(&id) {
+            if let Err(e) = manager.start_server(id) {
                 app.set_error(format!("Enabled but connect failed: {e}"));
             }
             refresh_servers(app, store);
@@ -429,9 +431,9 @@ async fn exec_servers(
             if app.servers.is_empty() {
                 app.set_error("No servers"); return;
             }
-            let id = app.servers[app.servers_cursor].id.clone();
-            manager.stop_server(&id);
-            if let Err(e) = store.set_server_state(&id, NodeState::Disabled) {
+            let id = app.servers[app.servers_cursor].id;
+            manager.stop_server(id);
+            if let Err(e) = store.set_server_state(id, NodeState::Disabled) {
                 app.set_error(format!("Error: {e}")); return;
             }
             refresh_servers(app, store);
@@ -443,9 +445,9 @@ async fn exec_servers(
             if app.servers.is_empty() {
                 app.set_error("No servers"); return;
             }
-            let id = app.servers[app.servers_cursor].id.clone();
+            let id = app.servers[app.servers_cursor].id;
             let name = words[1..].join(" ");
-            if let Err(e) = store.rename_server(&id, &name) {
+            if let Err(e) = store.rename_server(id, &name) {
                 app.set_error(format!("Error: {e}")); return;
             }
             refresh_servers(app, store);
@@ -454,9 +456,9 @@ async fn exec_servers(
             if app.servers.is_empty() {
                 app.set_error("No servers"); return;
             }
-            let id = app.servers[app.servers_cursor].id.clone();
-            manager.stop_server(&id);
-            if let Err(e) = store.delete_server(&id) {
+            let id = app.servers[app.servers_cursor].id;
+            manager.stop_server(id);
+            if let Err(e) = store.delete_server(id) {
                 app.set_error(format!("Error: {e}")); return;
             }
             refresh_servers(app, store);
@@ -487,9 +489,9 @@ async fn exec_servers(
             if app.servers.is_empty() {
                 app.set_error("No servers"); return;
             }
-            let id = app.servers[app.servers_cursor].id.clone();
+            let id = app.servers[app.servers_cursor].id;
             let path_str = shellexpand::tilde(words[1]);
-            match store.export_server_card(&id) {
+            match store.export_server_card(id) {
                 Ok(card) => match card.save(std::path::Path::new(path_str.as_ref())) {
                     Ok(()) => app.set_info(vec![format!("Exported server '{}' to {}", id, path_str)]),
                     Err(e) => app.set_error(format!("Write error: {e}")),
@@ -498,13 +500,14 @@ async fn exec_servers(
             }
         }
         "deploy" => {
-            if words.len() < 4 {
-                app.set_error("Usage: deploy <ssh_user> <ssh_ip> <ssh_pass>"); return;
+            if words.len() < 5 {
+                app.set_error("Usage: deploy <ssh_user> <ssh_ip> <ssh_pass> <name>"); return;
             }
             let ssh_user = words[1];
             let ssh_ip = words[2];
             let ssh_pass = words[3];
-            let server_id = format!("srv-{}", address_short(ssh_ip));
+            let name = words[4..].join(" ");
+            let server_id: u128 = rand::random();
 
             let creds = crate::setup_server::SshCredentials::new(
                 ssh_user.to_string(),
@@ -515,12 +518,12 @@ async fn exec_servers(
             let admin_key = new_aes_key_hex();
             let address = format!("http://{}:50051", ssh_ip);
 
-            manager.stop_server(&server_id);
             if let Err(e) = crate::setup_server::setup_server(&creds, &user_key, &admin_key).await {
                 app.set_error(format!("Deploy failed: {e}")); return;
             }
             let card = ServerCard {
-                id: server_id.clone(),
+                id: server_id,
+                name: name.clone(),
                 address,
                 shared_key: hex::decode(&user_key).unwrap_or_default(),
                 admin_key: Some(hex::decode(&admin_key).unwrap_or_default()),
@@ -528,11 +531,11 @@ async fn exec_servers(
             if let Err(e) = store.save_server_card(&card) {
                 app.set_error(format!("Deployed but DB save failed: {e}")); return;
             }
-            let _ = store.set_server_state(&server_id, NodeState::Enabled);
-            let _ = manager.start_server(&server_id);
+            let _ = store.set_server_state(server_id, NodeState::Enabled);
+            let _ = manager.start_server(server_id);
             refresh_servers(app, store);
             app.set_info(vec![
-                format!("Server '{}' deployed", server_id),
+                format!("Server '{}' ({:032x}) deployed", name, server_id),
                 format!("  user_key:  {}", user_key),
                 format!("  admin_key: {}", admin_key),
             ]);
@@ -549,12 +552,12 @@ async fn exec_servers(
                 words[2].to_string(),
                 words[3].to_string(),
             );
-            let id = app.servers[app.servers_cursor].id.clone();
-            manager.stop_server(&id);
+            let id = app.servers[app.servers_cursor].id;
+            manager.stop_server(id);
             if let Err(e) = crate::setup_server::remove_server(&creds).await {
                 app.set_error(format!("Remote removal failed: {e}")); return;
             }
-            let _ = store.delete_server(&id);
+            let _ = store.delete_server(id);
             refresh_servers(app, store);
         }
         "admin" => {
@@ -576,41 +579,44 @@ async fn exec_servers(
             let sub = words[1].to_lowercase();
             match sub.as_str() {
                 "create-chat" => {
-                    let id = match words.get(2) {
+                    let name = match words.get(2) {
                         Some(s) if !s.is_empty() => *s,
                         _ => { app.set_error("Usage: admin create-chat <chat_id>"); return; }
                     };
                     let encryption_key = new_aes_key_bytes();
-                    match transport.create_chat(&admin_key, id, 1000, 10_485_760).await {
-                        Ok(r) if r.success => {
+                    match transport.create_chat(&admin_key, name, 1000, 10_485_760).await {
+                        Ok(chat_id) => {
                             let card = crate::config::ChatCard {
                                 server_id: server.id.clone(),
-                                chat_id: id.to_string(),
-                                name: id.to_string(),
+                                chat_id: chat_id,
+                                name: name.to_string(),
                                 encryption_key: encryption_key.clone(),
                             };
                             match store.save_chat_card(&card) {
                                 Ok(()) => {
                                     refresh_chats(app, store);
                                     app.set_info(vec![
-                                        format!("Chat '{}' created", id),
+                                        format!("Chat '{}' created", chat_id),
                                         format!("Key: {}", hex::encode(&encryption_key)),
                                     ]);
                                 }
                                 Err(e) => app.set_error(format!("Chat created on server but local save failed: {e}")),
                             }
                         }
-                        Ok(r) => app.set_error(format!("Server rejected: {}", r.error)),
                         Err(e) => app.set_error(format!("Error: {e}")),
                     }
                 }
                 "delete-chat" => {
-                    let id = match words.get(2) {
+                    let id_str = match words.get(2) {
                         Some(s) if !s.is_empty() => *s,
-                        _ => { app.set_error("Usage: admin delete-chat <chat_id>"); return; }
+                        _ => { app.set_error("Usage: admin delete-chat <chat_id_hex>"); return; }
                     };
-                    match transport.delete_chat(&admin_key, id).await {
-                        Ok(r) if r.success => app.set_info(vec![format!("Chat '{}' deleted", id)]),
+                    let chat_id = match u128::from_str_radix(id_str.trim_start_matches("0x"), 16) {
+                        Ok(id) => id,
+                        Err(_) => { app.set_error("Invalid chat_id (expected hex)"); return; }
+                    };
+                    match transport.delete_chat(&admin_key, chat_id).await {
+                        Ok(r) if r.success => app.set_info(vec![format!("Chat '{:032x}' deleted", chat_id)]),
                         Ok(r) => app.set_error(format!("Failed: {}", r.error)),
                         Err(e) => app.set_error(format!("Error: {e}")),
                     }
@@ -622,7 +628,10 @@ async fn exec_servers(
                                 app.set_info(vec!["No chats on server".into()]);
                             } else {
                                 app.set_info(r.chats.iter().map(|c| {
-                                    format!("  {} ({}..{})", c.chat_id, c.earliest_timestamp_ms, c.latest_timestamp_ms)
+                                    let cid = crate::transport::chat_id_from_bytes(&c.chat_id)
+                                        .map(|id| format!("{:032x}", id))
+                                        .unwrap_or_else(|_| hex::encode(&c.chat_id));
+                                    format!("  {} '{}' ({}..{})", cid, c.name, c.earliest_timestamp_ms, c.latest_timestamp_ms)
                                 }).collect());
                             }
                         }
@@ -641,7 +650,7 @@ async fn exec_servers(
 async fn exec_chats(
     input: &str,
     words: &[&str],
-    server_id: &str,
+    server_id: u128,
     app: &mut App,
     store: &Store,
     manager: &mut ConnectionManager,
@@ -681,22 +690,22 @@ async fn exec_chats(
             if app.chats.is_empty() {
                 app.set_error("No chats"); return;
             }
-            let chat_id = app.chats[app.chats_cursor].chat_id.clone();
+            let chat_id = app.chats[app.chats_cursor].chat_id;
             let mut initial: VecDeque<String> = VecDeque::new();
             let mut last_date: Option<String> = None;
-            if let Ok(stored) = store.get_messages(&chat_id, 100) {
+            if let Ok(stored) = store.get_messages(chat_id, 100) {
                 for msg in stored {
                     let (sid, sname) = parse_stored_sender(msg.sender.as_deref().unwrap_or(""));
                     let display = resolve_sender_name(&app.contacts, &sid, &sname);
                     let ts = chrono::DateTime::from_timestamp_millis(msg.timestamp_ms)
                         .map(|dt| dt.format("%H:%M").to_string())
                         .unwrap_or_else(|| msg.timestamp_ms.to_string());
-                    let line = format!("[{ts}] {display}: {}", msg.text);
+                    let line = format!("[{ts}] {}{}: {}", display, verification_badge(&msg.verification), msg.text);
                     push_with_date_sep(&mut initial, &mut last_date, msg.timestamp_ms, line);
                 }
             }
             app.live_mode = LiveMode::On {
-                server_id: server_id.to_string(),
+                server_id: server_id,
                 chat_id,
                 messages: initial,
                 scroll: 0,
@@ -707,8 +716,8 @@ async fn exec_chats(
             if app.chats.is_empty() {
                 app.set_error("No chats"); return;
             }
-            let chat = app.chats[app.chats_cursor].chat_id.clone();
-            if let Err(e) = store.set_chat_state(server_id, &chat, NodeState::Enabled) {
+            let chat = app.chats[app.chats_cursor].chat_id;
+            if let Err(e) = store.set_chat_state(server_id, chat, NodeState::Enabled) {
                 app.set_error(format!("Error: {e}")); return;
             }
             let _ = manager.restart_server(server_id);
@@ -718,8 +727,8 @@ async fn exec_chats(
             if app.chats.is_empty() {
                 app.set_error("No chats"); return;
             }
-            let chat = app.chats[app.chats_cursor].chat_id.clone();
-            if let Err(e) = store.set_chat_state(server_id, &chat, NodeState::Disabled) {
+            let chat = app.chats[app.chats_cursor].chat_id;
+            if let Err(e) = store.set_chat_state(server_id, chat, NodeState::Disabled) {
                 app.set_error(format!("Error: {e}")); return;
             }
             let _ = manager.restart_server(server_id);
@@ -732,9 +741,9 @@ async fn exec_chats(
             if app.chats.is_empty() {
                 app.set_error("No chats"); return;
             }
-            let chat_id = app.chats[app.chats_cursor].chat_id.clone();
+            let chat_id = app.chats[app.chats_cursor].chat_id;
             let name = words[1..].join(" ");
-            if let Err(e) = store.rename_chat(server_id, &chat_id, &name) {
+            if let Err(e) = store.rename_chat(server_id, chat_id, &name) {
                 app.set_error(format!("Error: {e}")); return;
             }
             refresh_chats(app, store);
@@ -743,8 +752,8 @@ async fn exec_chats(
             if app.chats.is_empty() {
                 app.set_error("No chats"); return;
             }
-            let chat_id = app.chats[app.chats_cursor].chat_id.clone();
-            if let Err(e) = store.delete_chat(server_id, &chat_id) {
+            let chat_id = app.chats[app.chats_cursor].chat_id;
+            if let Err(e) = store.delete_chat(server_id, chat_id) {
                 app.set_error(format!("Error: {e}")); return;
             }
             if let LiveMode::On { chat_id: live_cid, .. } = &app.live_mode {
@@ -780,9 +789,9 @@ async fn exec_chats(
             if app.chats.is_empty() {
                 app.set_error("No chats"); return;
             }
-            let chat_id = app.chats[app.chats_cursor].chat_id.clone();
+            let chat_id = app.chats[app.chats_cursor].chat_id;
             let path_str = shellexpand::tilde(words[1]);
-            match store.export_chat_card(server_id, &chat_id) {
+            match store.export_chat_card(server_id, chat_id) {
                 Ok(card) => match card.save(std::path::Path::new(path_str.as_ref())) {
                     Ok(()) => app.set_info(vec![format!("Exported chat '{}/{}' to {}", server_id, chat_id, path_str)]),
                     Err(e) => app.set_error(format!("Write error: {e}")),
@@ -801,20 +810,20 @@ async fn exec_chats(
                 Some(id) => id,
                 None => {
                     if app.chats.is_empty() { app.set_error("No chat selected"); return; }
-                    app.chats[app.chats_cursor].chat_id.clone()
+                    app.chats[app.chats_cursor].chat_id
                 }
             };
             let server = match store.load_server(server_id) {
                 Ok(s) => s,
                 Err(e) => { app.set_error(format!("Error: {e}")); return; }
             };
-            let chat = match store.load_chat(server_id, &chat_id) {
+            let chat = match store.load_chat(server_id, chat_id) {
                 Ok(c) => c,
                 Err(e) => { app.set_error(format!("Error: {e}")); return; }
             };
-            let payload = format!("{}\x1e{}\x1e{}", app.my_id, app.my_name, message);
+            let payload = build_payload(&app.my_id, &app.my_name, message, chat_id, chat.verification_mode, store);
             match Transport::connect(&server.address, &server.shared_key_bytes).await {
-                Ok(mut t) => match t.send_message(&chat_id, &payload, &chat.encryption_key_bytes).await {
+                Ok(mut t) => match t.send_message(chat_id, &payload, &chat.encryption_key_bytes).await {
                     Ok(r) if r.accepted => {}
                     Ok(r) => app.set_error(format!("Rejected: {}", r.error)),
                     Err(e) => app.set_error(format!("Send error: {e}")),
@@ -822,15 +831,33 @@ async fn exec_chats(
                 Err(e) => app.set_error(format!("Connection error: {e}")),
             }
         }
+        "verify" => {
+            let chat_id = match active_chat_id(app) {
+                Some(id) => id,
+                None => {
+                    if app.chats.is_empty() { app.set_error("No chat selected"); return; }
+                    app.chats[app.chats_cursor].chat_id
+                }
+            };
+            let chat = match store.load_chat(server_id, chat_id) {
+                Ok(c) => c,
+                Err(e) => { app.set_error(format!("Error: {e}")); return; }
+            };
+            let new_mode = !chat.verification_mode;
+            match store.set_chat_verification_mode(server_id, chat_id, new_mode) {
+                Ok(_) => app.set_info(vec![format!("Verification mode: {}", if new_mode { "on" } else { "off" })]),
+                Err(e) => app.set_error(format!("Error: {e}")),
+            }
+        }
         "history" => {
             let chat_id = match active_chat_id(app) {
                 Some(id) => id,
                 None => {
                     if app.chats.is_empty() { app.set_error("No chat selected"); return; }
-                    app.chats[app.chats_cursor].chat_id.clone()
+                    app.chats[app.chats_cursor].chat_id
                 }
             };
-            m_core::log_debug!("tui: history command server={} chat_id={}", server_id, chat_id);
+            m_core::log_debug!("tui: history command server={} chat_id={:032x}", server_id, chat_id);
             let mut limit = 50u32;
             for i in 1..words.len() {
                 if words[i] == "--limit" {
@@ -841,20 +868,22 @@ async fn exec_chats(
                 Ok(s) => s,
                 Err(e) => { app.set_error(format!("Error: {e}")); return; }
             };
-            let chat = match store.load_chat(server_id, &chat_id) {
+            let chat = match store.load_chat(server_id, chat_id) {
                 Ok(c) => c,
                 Err(e) => { app.set_error(format!("Error: {e}")); return; }
             };
             match Transport::connect(&server.address, &server.shared_key_bytes).await {
-                Ok(mut t) => match t.get_history(&chat_id, 0, 0, limit).await {
+                Ok(mut t) => match t.get_history(chat_id, 0, 0, limit).await {
                     Ok(resp) => {
                         let mut lines: Vec<String> = Vec::new();
                         let mut hist_last_date: Option<String> = None;
                         for msg in &resp.messages {
+                            let msg_chat_id = crate::transport::chat_id_from_bytes(&msg.chat_id)
+                                .unwrap_or(chat_id);
                             let raw = crate::transport::decrypt_payload(
                                 &msg.encrypted_payload,
                                 &chat.encryption_key_bytes,
-                                &msg.chat_id,
+                                msg_chat_id,
                             ).unwrap_or_else(|_| "<decryption failed>".into());
                             let (sid, sname, text) = {
                                 let mut parts = raw.splitn(3, '\x1e');
@@ -910,41 +939,44 @@ async fn exec_chats(
             let sub = words[1].to_lowercase();
             match sub.as_str() {
                 "create-chat" => {
-                    let id = match words.get(2) {
+                    let name = match words.get(2) {
                         Some(s) if !s.is_empty() => *s,
-                        _ => { app.set_error("Usage: admin create-chat <chat_id>"); return; }
+                        _ => { app.set_error("Usage: admin create-chat <name>"); return; }
                     };
                     let encryption_key = new_aes_key_bytes();
-                    match transport.create_chat(&admin_key, id, 1000, 10_485_760).await {
-                        Ok(r) if r.success => {
+                    match transport.create_chat(&admin_key, name, 1000, 10_485_760).await {
+                        Ok(chat_id) => {
                             let card = crate::config::ChatCard {
-                                server_id: server_id.to_string(),
-                                chat_id: id.to_string(),
-                                name: id.to_string(),
+                                server_id,
+                                chat_id,
+                                name: name.to_string(),
                                 encryption_key: encryption_key.clone(),
                             };
                             match store.save_chat_card(&card) {
                                 Ok(()) => {
                                     refresh_chats(app, store);
                                     app.set_info(vec![
-                                        format!("Chat '{}' created", id),
+                                        format!("Chat '{}' ({:032x}) created", name, chat_id),
                                         format!("Key: {}", hex::encode(&encryption_key)),
                                     ]);
                                 }
                                 Err(e) => app.set_error(format!("Chat created on server but local save failed: {e}")),
                             }
                         }
-                        Ok(r) => app.set_error(format!("Server rejected: {}", r.error)),
                         Err(e) => app.set_error(format!("Error: {e}")),
                     }
                 }
                 "delete-chat" => {
-                    let id = match words.get(2) {
+                    let id_str = match words.get(2) {
                         Some(s) if !s.is_empty() => *s,
-                        _ => { app.set_error("Usage: admin delete-chat <chat_id>"); return; }
+                        _ => { app.set_error("Usage: admin delete-chat <chat_id_hex>"); return; }
                     };
-                    match transport.delete_chat(&admin_key, id).await {
-                        Ok(r) if r.success => app.set_info(vec![format!("Chat '{}' deleted", id)]),
+                    let chat_id = match u128::from_str_radix(id_str.trim_start_matches("0x"), 16) {
+                        Ok(id) => id,
+                        Err(_) => { app.set_error("Invalid chat_id (expected hex)"); return; }
+                    };
+                    match transport.delete_chat(&admin_key, chat_id).await {
+                        Ok(r) if r.success => app.set_info(vec![format!("Chat '{:032x}' deleted", chat_id)]),
                         Ok(r) => app.set_error(format!("Failed: {}", r.error)),
                         Err(e) => app.set_error(format!("Error: {e}")),
                     }
@@ -956,7 +988,10 @@ async fn exec_chats(
                                 app.set_info(vec!["No chats on server".into()]);
                             } else {
                                 app.set_info(r.chats.iter().map(|c| {
-                                    format!("  {} ({}..{})", c.chat_id, c.earliest_timestamp_ms, c.latest_timestamp_ms)
+                                    let cid = crate::transport::chat_id_from_bytes(&c.chat_id)
+                                        .map(|id| format!("{:032x}", id))
+                                        .unwrap_or_else(|_| hex::encode(&c.chat_id));
+                                    format!("  {} '{}' ({}..{})", cid, c.name, c.earliest_timestamp_ms, c.latest_timestamp_ms)
                                 }).collect());
                             }
                         }
@@ -970,9 +1005,9 @@ async fn exec_chats(
     }
 }
 
-fn active_chat_id(app: &App) -> Option<String> {
+fn active_chat_id(app: &App) -> Option<u128> {
     if let LiveMode::On { chat_id, .. } = &app.live_mode {
-        Some(chat_id.clone())
+        Some(*chat_id)
     } else {
         None
     }
@@ -1086,7 +1121,7 @@ async fn confirm_share_step(app: &mut App, store: &Store) {
         ShareStep::SelectServer { contact, servers, cursor } => {
             let server = servers[*cursor].clone();
             let contact = contact.clone();
-            let chats = store.list_chats_for_server(&server.id).unwrap_or_default();
+            let chats = store.list_chats_for_server(server.id).unwrap_or_default();
             if chats.is_empty() {
                 app.overlay = Overlay::Error("No chats on this server".into());
                 return;
@@ -1116,11 +1151,16 @@ async fn confirm_share_step(app: &mut App, store: &Store) {
             };
 
             let data = ShareData::Chat(ChatShareData {
-                server_id: server.id.clone(),
-                chat_id: chat.chat_id.clone(),
+                id: chat.chat_id,
                 name: chat.name.clone(),
                 encryption_key: chat.encryption_key_bytes.clone(),
-                server_admin_key: server.admin_key_bytes.clone(),
+                server: ServerShareData {
+                    id: server.id,
+                    name: server.name.clone(),
+                    host: server.address.clone(),
+                    shared_key: server.shared_key_bytes.clone(),
+                    admin_key: server.admin_key_bytes.clone(),
+                },
             });
 
             match crate::share::send_share(data, &contact_record, &identity, 17777).await {
@@ -1200,13 +1240,6 @@ fn new_aes_key_bytes() -> Vec<u8> {
     use m_core::crypto::algorithms::symmetric::Aes256Gcm;
     use m_core::crypto::{CryptoKey, SymmetricCipher};
     Aes256Gcm::new().get_key().as_bytes().to_vec()
-}
-
-fn address_short(addr: &str) -> String {
-    use m_core::crypto::Hash;
-    use m_core::crypto::algorithms::hash::Blake3Hash;
-    let bytes = Blake3Hash::hash(addr.as_bytes(), 16).unwrap_or_default();
-    hex::encode(&bytes[..4])
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -1351,12 +1384,12 @@ async fn run_inner(
                             let my_id = app.my_id.clone();
                             let my_name = app.my_name.clone();
                             m_core::log_debug!("tui: live send server={} chat={}", sid, cid);
-                            match store.load_server(&sid) {
-                                Ok(server) => match store.load_chat(&sid, &cid) {
+                            match store.load_server(sid) {
+                                Ok(server) => match store.load_chat(sid, cid) {
                                     Ok(chat) => match Transport::connect(&server.address, &server.shared_key_bytes).await {
                                         Ok(mut t) => {
-                                            let payload = format!("{}\x1e{}\x1e{}", my_id, my_name, input);
-                                            match t.send_message(&cid, &payload, &chat.encryption_key_bytes).await {
+                                            let payload = build_payload(&my_id, &my_name, &input, cid, chat.verification_mode, &store);
+                                            match t.send_message(cid, &payload, &chat.encryption_key_bytes).await {
                                                 Ok(r) if r.accepted => {}
                                                 Ok(r) => app.set_error(format!("Rejected: {}", r.error)),
                                                 Err(e) => app.set_error(format!("Send error: {e}")),
@@ -1501,6 +1534,33 @@ fn resolve_sender_name(contacts: &[ContactRecord], sender_id: &str, sender_name:
     }
 }
 
+fn build_payload(my_id: &str, my_name: &str, text: &str, chat_id: u128, verification_mode: bool, store: &Store) -> String {
+    let base = format!("{}\x1e{}\x1e{}", my_id, my_name, text);
+    if !verification_mode { return base; }
+    let Ok(Some(identity)) = store.load_identity() else { return base; };
+    let (Ok(sk), Ok(pk)) = (
+        m_core::crypto::CryptoKey::from_bytes(&identity.signing_sk_bytes),
+        m_core::crypto::CryptoKey::from_bytes(&identity.signing_pk_bytes),
+    ) else { return base; };
+    let mut signer = Dilithium2::new();
+    signer.set_secret(sk);
+    signer.set_public(pk);
+    let sign_material = format!("{:032x}\x1e{}\x1e{}", chat_id, my_id, text);
+    match signer.sign_detached(sign_material.as_bytes()) {
+        Ok(sig) => format!("{}\x1e{}", base, hex::encode(&sig)),
+        Err(_) => base,
+    }
+}
+
+fn verification_badge(v: &VerificationStatus) -> &'static str {
+    match v {
+        VerificationStatus::Verified => " ✓",
+        VerificationStatus::CannotVerify => " ?",
+        VerificationStatus::Tampered => " ✗",
+        VerificationStatus::NoSignature => "",
+    }
+}
+
 fn cursor_down(app: &mut App) {
     match &app.screen {
         Screen::Contacts => {
@@ -1527,7 +1587,7 @@ fn handle_live_event(event: LiveEvent, app: &mut App, manager: &mut ConnectionMa
         LiveEvent::Message(msg) => {
             m_core::log_debug!("tui: LiveEvent::Message server={} chat_id={} chat_name={}", msg.server_id, msg.chat_id, msg.chat_name);
             let display = resolve_sender_name(&app.contacts, &msg.sender_id, &msg.sender_name);
-            let line = format!("[{}] {}: {}", msg.timestamp, display, msg.text);
+            let line = format!("[{}] {}{}: {}", msg.timestamp, display, verification_badge(&msg.verification), msg.text);
             let ts_ms = msg.timestamp_ms;
             if let LiveMode::On { server_id, chat_id, messages, last_date, .. } = &mut app.live_mode {
                 if *server_id == msg.server_id && *chat_id == msg.chat_id {
@@ -1551,19 +1611,16 @@ fn handle_live_event(event: LiveEvent, app: &mut App, manager: &mut ConnectionMa
         }
         LiveEvent::ServerUnavailable(sid) => {
             m_core::log_warn!("tui: LiveEvent::ServerUnavailable server={}", sid);
-            manager.handle_unavailable_server(&sid);
+            manager.handle_unavailable_server(sid);
             refresh_servers(app, store);
         }
         LiveEvent::Disconnected(sid) => {
             m_core::log_info!("tui: LiveEvent::Disconnected server={}", sid);
-            manager.handle_disconnected(&sid);
+            manager.handle_disconnected(sid);
             refresh_servers(app, store);
         }
         LiveEvent::ShareReceived(data) => {
-            let result = match &data {
-                ShareData::Server(s) => store.upsert_shared_server(s),
-                ShareData::Chat(c) => store.upsert_shared_chat(c),
-            };
+            let result = store.merge_share_data(&data);
             let line = match result {
                 Ok(msg) => format!("Received: {}", msg),
                 Err(e) => format!("Receive error: {e}"),
@@ -1748,8 +1805,13 @@ fn draw_servers(f: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_chats(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let server_name_buf;
     let server_id = if let Screen::Chats { server_id } = &app.screen {
-        server_id.as_str()
+        server_name_buf = app.servers.iter()
+            .find(|s| s.id == *server_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| format!("{:08x}", server_id));
+        server_name_buf.as_str()
     } else {
         ""
     };

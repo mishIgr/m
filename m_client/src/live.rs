@@ -5,9 +5,12 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use m_core::proto::*;
+use m_core::crypto::{CryptoKey, AsymmetricCipher};
+use m_core::crypto::algorithms::signature::Dilithium2;
+use m_core::crypto::key::Key;
 
 use crate::sharing::ShareData;
-use crate::store::{ChatRecord, Store, StoredMessage};
+use crate::store::{ChatRecord, Store, StoredMessage, VerificationStatus};
 use crate::transport::{self, chat_id_bytes, chat_id_from_bytes, decrypt_payload, make_envelope, parse_server_event};
 
 pub struct LiveMessage {
@@ -19,14 +22,36 @@ pub struct LiveMessage {
     pub text: String,
     pub timestamp: String,
     pub timestamp_ms: i64,
+    pub verification: VerificationStatus,
 }
 
-fn parse_payload(raw: &str) -> (String, String, String) {
-    let parts: Vec<&str> = raw.splitn(3, '\x1e').collect();
-    if parts.len() == 3 {
-        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string())
+fn parse_payload(raw: &str) -> (String, String, String, Option<Vec<u8>>) {
+    let parts: Vec<&str> = raw.splitn(4, '\x1e').collect();
+    if parts.len() == 4 {
+        let sig = hex::decode(parts[3]).ok();
+        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string(), sig)
+    } else if parts.len() == 3 {
+        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string(), None)
     } else {
-        (String::new(), String::new(), raw.to_string())
+        (String::new(), String::new(), raw.to_string(), None)
+    }
+}
+
+fn verify_message_sig(store: &Store, sender_id: &str, chat_id: u128, text: &str, sig: &[u8]) -> VerificationStatus {
+    let sign_material = format!("{:032x}\x1e{}\x1e{}", chat_id, sender_id, text);
+    match store.load_contact(sender_id) {
+        Ok(contact) => {
+            let pk: Key<{ Dilithium2::PUBLIC_KEY_SIZE }> =
+                match CryptoKey::from_bytes(&contact.signing_pk_bytes) {
+                    Ok(k) => k,
+                    Err(_) => return VerificationStatus::CannotVerify,
+                };
+            match Dilithium2::verify_detached(&pk, sign_material.as_bytes(), sig) {
+                Ok(true) => VerificationStatus::Verified,
+                _ => VerificationStatus::Tampered,
+            }
+        }
+        Err(_) => VerificationStatus::CannotVerify,
     }
 }
 
@@ -164,7 +189,12 @@ pub async fn subscribe(
                             None => continue,
                         };
 
-                        let (sender_id, sender_name, text) = parse_payload(&raw);
+                        let (sender_id, sender_name, text, sig_opt) = parse_payload(&raw);
+
+                        let verification = match &sig_opt {
+                            Some(sig) => verify_message_sig(&store, &sender_id, chat_id, &text, sig),
+                            None => VerificationStatus::NoSignature,
+                        };
 
                         let ts = match chrono::DateTime::from_timestamp_millis(msg.timestamp_ms) {
                             Some(dt) => dt.format("%H:%M").to_string(),
@@ -180,6 +210,7 @@ pub async fn subscribe(
                             timestamp_ms: msg.timestamp_ms,
                             text: text.clone(),
                             sender: Some(format!("{}\x1e{}", sender_id, sender_name)),
+                            verification: verification.clone(),
                         }) {
                             m_core::log_warn!("live: save_message failed server={:032x} chat={:032x} ts={} error={}", server_id, chat_id, msg.timestamp_ms, e);
                         }
@@ -193,6 +224,7 @@ pub async fn subscribe(
                             text,
                             timestamp: ts,
                             timestamp_ms: msg.timestamp_ms,
+                            verification,
                         }));
 
                         let ack = ClientEvent {

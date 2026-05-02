@@ -45,6 +45,15 @@ impl fmt::Display for NodeState {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub enum VerificationStatus {
+    #[default]
+    NoSignature,
+    Verified,
+    CannotVerify,
+    Tampered,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerRecord {
     pub id: u128,
@@ -55,10 +64,6 @@ pub struct ServerRecord {
     pub state: NodeState,
 }
 
-impl ServerRecord {
-    pub fn id_hex(&self) -> String { id_key(self.id) }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRecord {
     pub server_id: u128,
@@ -67,11 +72,8 @@ pub struct ChatRecord {
     pub encryption_key_bytes: Vec<u8>,
     pub last_synced_ts: i64,
     pub state: NodeState,
-}
-
-impl ChatRecord {
-    pub fn server_id_hex(&self) -> String { id_key(self.server_id) }
-    pub fn chat_id_hex(&self) -> String { id_key(self.chat_id) }
+    #[serde(default)]
+    pub verification_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +84,8 @@ pub struct StoredMessage {
     pub text: String,
     #[serde(default)]
     pub sender: Option<String>,
+    #[serde(default)]
+    pub verification: VerificationStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +197,7 @@ impl Store {
             encryption_key_bytes: card.encryption_key.clone(),
             last_synced_ts: 0,
             state: NodeState::Disabled,
+            verification_mode: false,
         };
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         table.put(&key, &record)?;
@@ -262,6 +267,15 @@ impl Store {
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         let mut record = self.load_chat(server_id, chat_id)?;
         record.last_synced_ts = ts;
+        table.put(&key, &record)?;
+        Ok(())
+    }
+
+    pub fn set_chat_verification_mode(&self, server_id: u128, chat_id: u128, enabled: bool) -> Result<()> {
+        let key = chat_key(server_id, chat_id);
+        let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
+        let mut record = self.load_chat(server_id, chat_id)?;
+        record.verification_mode = enabled;
         table.put(&key, &record)?;
         Ok(())
     }
@@ -412,6 +426,7 @@ impl Store {
             encryption_key_bytes: c.encryption_key.clone(),
             last_synced_ts: existing.as_ref().map(|e| e.last_synced_ts).unwrap_or(0),
             state: existing.as_ref().map(|e| e.state).unwrap_or(NodeState::Disabled),
+            verification_mode: existing.as_ref().map(|e| e.verification_mode).unwrap_or(false),
         };
         table.put(&key, &record)?;
 
