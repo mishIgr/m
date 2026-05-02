@@ -6,6 +6,7 @@ mod live;
 mod sharing;
 mod identity;
 mod share;
+mod manual_share;
 mod setup_server;
 mod tui;
 

@@ -24,6 +24,7 @@ use crate::config::{ServerCard, ChatCard};
 use crate::connection_manager::ConnectionManager;
 use crate::identity::ContactCard;
 use crate::live::LiveEvent;
+use crate::manual_share;
 use crate::sharing::{ShareData, ChatShareData, ServerShareData};
 use crate::store::{ContactRecord, ChatRecord, NodeState, ServerRecord, Store, VerificationStatus};
 use crate::transport::Transport;
@@ -78,6 +79,14 @@ enum TorStatus {
     Running,
 }
 
+// ── File-based share context ─────────────────────────────────────────────────
+
+struct FileShareContext {
+    contact_id: String,
+    offer_path: String,
+    response_path: String,
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 struct App {
@@ -96,6 +105,8 @@ struct App {
     contacts_cursor: usize,
     servers_cursor: usize,
     chats_cursor: usize,
+
+    file_share_context: Option<FileShareContext>,
 
     input: String,
     cursor_pos: usize,
@@ -121,6 +132,7 @@ impl App {
             contacts_cursor: 0,
             servers_cursor: 0,
             chats_cursor: 0,
+            file_share_context: None,
             input: String::new(),
             cursor_pos: 0,
             info_scroll: 0,
@@ -1028,11 +1040,14 @@ async fn exec_share(
         "help" | "?" => {
             app.set_info(vec![
                 "share commands:".into(),
-                "  run-tor                Start Tor daemon (ESC to cancel)".into(),
-                "  stop-tor               Stop Tor daemon".into(),
-                "  receiving-data         Start onion share listener (ESC to stop)".into(),
-                "  share-data             Interactive share wizard".into(),
-                "  contacts / servers     Switch screen".into(),
+                "  run-tor                         Start Tor daemon (ESC to cancel)".into(),
+                "  stop-tor                        Stop Tor daemon".into(),
+                "  receiving-data                  Start onion share listener (ESC to stop)".into(),
+                "  share-data                      Interactive share wizard (via Tor)".into(),
+                "  gen-offer <contact> <path>      Generate KEM offer file (step 1, you are B)".into(),
+                "  respond-offer <contact> <offer> <response>  Respond to offer file (step 2, you are A)".into(),
+                "  load-response <contact> <path>  Import response file (step 3, you are B)".into(),
+                "  contacts / servers              Switch screen".into(),
             ]);
         }
         "run-tor" => {
@@ -1091,6 +1106,70 @@ async fn exec_share(
                 app.set_error("No contacts to share with"); return;
             }
             app.overlay = Overlay::ShareData(ShareStep::SelectContact { contacts, cursor: 0 });
+        }
+        "gen-offer" => {
+            let (contact_id, path) = match (words.get(1), words.get(2)) {
+                (Some(c), Some(p)) => (*c, *p),
+                _ => { app.set_error("Usage: gen-offer <contact_id> <path>"); return; }
+            };
+            let identity = match store.load_identity() {
+                Ok(Some(id)) => id,
+                _ => { app.set_error("No identity"); return; }
+            };
+            let contact = match store.load_contact(contact_id) {
+                Ok(c) => c,
+                Err(e) => { app.set_error(format!("Contact not found: {e}")); return; }
+            };
+            match manual_share::generate_kem_offer(&identity, &contact, store) {
+                Ok(bytes) => match std::fs::write(path, &bytes) {
+                    Ok(()) => app.set_info(vec![format!("Offer written to {path}")]),
+                    Err(e) => app.set_error(format!("Write error: {e}")),
+                },
+                Err(e) => app.set_error(format!("gen-offer error: {e}")),
+            }
+        }
+        "respond-offer" => {
+            let (contact_id, offer_path, response_path) = match (words.get(1), words.get(2), words.get(3)) {
+                (Some(c), Some(o), Some(r)) => (*c, *o, *r),
+                _ => { app.set_error("Usage: respond-offer <contact_id> <offer_path> <response_path>"); return; }
+            };
+            let contact = match store.load_contact(contact_id) {
+                Ok(c) => c,
+                Err(e) => { app.set_error(format!("Contact not found: {e}")); return; }
+            };
+            let servers = store.list_servers().unwrap_or_default();
+            if servers.is_empty() { app.set_error("No servers configured"); return; }
+            app.file_share_context = Some(FileShareContext {
+                contact_id: contact_id.to_string(),
+                offer_path: offer_path.to_string(),
+                response_path: response_path.to_string(),
+            });
+            app.overlay = Overlay::ShareData(ShareStep::SelectServer { contact, servers, cursor: 0 });
+        }
+        "load-response" => {
+            let (contact_id, path) = match (words.get(1), words.get(2)) {
+                (Some(c), Some(p)) => (*c, *p),
+                _ => { app.set_error("Usage: load-response <contact_id> <path>"); return; }
+            };
+            let identity = match store.load_identity() {
+                Ok(Some(id)) => id,
+                _ => { app.set_error("No identity"); return; }
+            };
+            let contact = match store.load_contact(contact_id) {
+                Ok(c) => c,
+                Err(e) => { app.set_error(format!("Contact not found: {e}")); return; }
+            };
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => { app.set_error(format!("Read error: {e}")); return; }
+            };
+            match manual_share::load_share_response(&bytes, &identity, &contact, store) {
+                Ok(data) => match store.merge_share_data(&data) {
+                    Ok(msg) => app.set_info(vec![format!("Imported: {msg}")]),
+                    Err(e) => app.set_error(format!("Merge error: {e}")),
+                },
+                Err(e) => app.set_error(format!("load-response error: {e}")),
+            }
         }
         _ => app.set_error(format!("Unknown command: {}. Type 'help'.", words[0])),
     }
@@ -1163,12 +1242,26 @@ async fn confirm_share_step(app: &mut App, store: &Store) {
                 },
             });
 
-            match crate::share::send_share(data, &contact_record, &identity, 17777).await {
-                Ok(()) => app.set_info(vec![format!(
-                    "Shared {}/{} with {}",
-                    server.id, chat.chat_id, contact.name
-                )]),
-                Err(e) => app.set_error(format!("Share error: {e}")),
+            if let Some(ctx) = app.file_share_context.take() {
+                let offer_bytes = match std::fs::read(&ctx.offer_path) {
+                    Ok(b) => b,
+                    Err(e) => { app.set_error(format!("Read offer error: {e}")); return; }
+                };
+                match manual_share::create_share_response(&offer_bytes, data, &identity, &contact_record, store) {
+                    Ok(response_bytes) => match std::fs::write(&ctx.response_path, &response_bytes) {
+                        Ok(()) => app.set_info(vec![format!("Response written to {}", ctx.response_path)]),
+                        Err(e) => app.set_error(format!("Write response error: {e}")),
+                    },
+                    Err(e) => app.set_error(format!("respond-offer error: {e}")),
+                }
+            } else {
+                match crate::share::send_share(data, &contact_record, &identity, 17777).await {
+                    Ok(()) => app.set_info(vec![format!(
+                        "Shared {}/{} with {}",
+                        server.id, chat.chat_id, contact.name
+                    )]),
+                    Err(e) => app.set_error(format!("Share error: {e}")),
+                }
             }
         }
     }

@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +16,6 @@ const CHATS_TABLE: &str = "chats";
 const MESSAGES_TABLE_PREFIX: &str = "messages:";
 const IDENTITY_TABLE: &str = "identity";
 const CONTACTS_TABLE: &str = "contacts";
-const PENDING_KEM_TABLE: &str = "pending_kem_offers";
 
 fn id_key(id: u128) -> String {
     format!("{:032x}", id)
@@ -111,13 +112,14 @@ pub struct ContactRecord {
 #[derive(Clone)]
 pub struct Store {
     db: RedbStore,
+    pending_kem_offers: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let db = RedbStore::open(path)
             .with_context(|| format!("Failed to open DB: {}", path.display()))?;
-        Ok(Self { db })
+        Ok(Self { db, pending_kem_offers: Arc::new(Mutex::new(HashMap::new())) })
     }
 
     // ── Server ────────────────────────────────────────────────────────────────
@@ -360,22 +362,6 @@ impl Store {
         Ok(())
     }
 
-    // ── Pending KEM offers (for manual share) ────────────────────────────────
-
-    pub fn save_pending_kem_offer(&self, contact_id: &str, kem_sk_bytes: &[u8]) -> Result<()> {
-        let table = self.db.table::<String, Vec<u8>>(PENDING_KEM_TABLE)?;
-        table.put(&contact_id.to_string(), &kem_sk_bytes.to_vec())?;
-        Ok(())
-    }
-
-    pub fn take_pending_kem_offer(&self, contact_id: &str) -> Result<Vec<u8>> {
-        let table = self.db.table::<String, Vec<u8>>(PENDING_KEM_TABLE)?;
-        let sk = table.get(&contact_id.to_string())?
-            .ok_or_else(|| anyhow::anyhow!("No pending KEM offer for contact={}", contact_id))?;
-        table.delete(&contact_id.to_string())?;
-        Ok(sk)
-    }
-
     // ── Share merge ───────────────────────────────────────────────────────────
 
     /// Merge received server data: update admin_key if new, save if not present.
@@ -439,5 +425,23 @@ impl Store {
             crate::sharing::ShareData::Server(s) => self.merge_server_share(s),
             crate::sharing::ShareData::Chat(c) => self.merge_chat_share(c),
         }
+    }
+
+    // ── Pending KEM offers (in-memory only) ───────────────────────────────────
+
+    pub fn save_pending_kem_offer(&self, contact_id: &str, kem_sk_bytes: &[u8]) -> Result<()> {
+        self.pending_kem_offers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pending_kem_offers lock poisoned"))?
+            .insert(contact_id.to_string(), kem_sk_bytes.to_vec());
+        Ok(())
+    }
+
+    pub fn take_pending_kem_offer(&self, contact_id: &str) -> Result<Vec<u8>> {
+        self.pending_kem_offers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pending_kem_offers lock poisoned"))?
+            .remove(contact_id)
+            .ok_or_else(|| anyhow::anyhow!("No pending KEM offer for contact '{}'", contact_id))
     }
 }
