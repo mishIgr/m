@@ -43,6 +43,17 @@ impl SshCredentials {
     }
 }
 
+async fn check_sshpass() -> io::Result<()> {
+    let status = Command::new("which").arg("sshpass").status().await?;
+    if !status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "sshpass is not installed. Run: sudo apt install sshpass",
+        ));
+    }
+    Ok(())
+}
+
 async fn run_ssh_command(creds: &SshCredentials, remote_cmd: &str) -> io::Result<()> {
     let target = format!("{}@{}", creds.username, creds.ip);
     m_core::log_info!("SSH [{}]: {}", target, remote_cmd);
@@ -190,6 +201,7 @@ async fn upload_files(creds: &SshCredentials, user_key: &str, admin_key: &str) -
 
 pub async fn setup_server(creds: &SshCredentials, user_key: &str, admin_key: &str) -> io::Result<()> {
     m_core::log_info!("=== setup_server start: {}@{} ===", creds.username, creds.ip);
+    check_sshpass().await?;
 
     let mkdir_cmd = format!(
         "mkdir -p {} {} {} {}",
