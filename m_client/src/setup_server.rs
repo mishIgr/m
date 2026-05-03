@@ -45,8 +45,9 @@ impl SshCredentials {
 
 async fn run_ssh_command(creds: &SshCredentials, remote_cmd: &str) -> io::Result<()> {
     let target = format!("{}@{}", creds.username, creds.ip);
+    m_core::log_info!("SSH [{}]: {}", target, remote_cmd);
 
-    let status = Command::new("sshpass")
+    let output = Command::new("sshpass")
         .arg("-p")
         .arg(&creds.password)
         .arg("ssh")
@@ -54,22 +55,38 @@ async fn run_ssh_command(creds: &SshCredentials, remote_cmd: &str) -> io::Result
         .arg("StrictHostKeyChecking=no")
         .arg("-o")
         .arg("UserKnownHostsFile=/dev/null")
-        .arg(target)
+        .arg(&target)
         .arg(remote_cmd)
         .stdin(Stdio::null())
-        .status()
+        .output()
         .await?;
 
-    if !status.success() {
-        m_core::log_error!("Error running ssh command: {}", remote_cmd);
-        return Err(io::Error::new(io::ErrorKind::Other, "Command failed"));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        m_core::log_error!(
+            "SSH command failed [{}]: {}\n  stdout: {}\n  stderr: {}",
+            target,
+            remote_cmd,
+            stdout.trim(),
+            stderr.trim()
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("SSH command failed: {}", stderr.trim()),
+        ));
     }
 
     Ok(())
 }
 
 async fn upload_config(creds: &SshCredentials, user_key: &str, admin_key: &str) -> io::Result<()> {
-    let template = tokio::fs::read_to_string(local_template_path()).await?;
+    let tmpl_path = local_template_path();
+    m_core::log_info!("Reading config template: {}", tmpl_path);
+    let template = tokio::fs::read_to_string(&tmpl_path).await.map_err(|e| {
+        m_core::log_error!("Failed to read config template '{}': {}", tmpl_path, e);
+        e
+    })?;
 
     let config_content = template
         .replace("{{DB_PATH}}", REMOTE_DB_PATH)
@@ -90,6 +107,7 @@ async fn upload_file_scp(
     local_path: &str,
     remote_path: &str,
 ) -> io::Result<()> {
+    m_core::log_info!("SCP: {} -> {}@{}:{}", local_path, creds.username, creds.ip, remote_path);
     let output = Command::new("sshpass")
         .arg("-p")
         .arg(&creds.password)
@@ -171,29 +189,38 @@ async fn upload_files(creds: &SshCredentials, user_key: &str, admin_key: &str) -
 }
 
 pub async fn setup_server(creds: &SshCredentials, user_key: &str, admin_key: &str) -> io::Result<()> {
+    m_core::log_info!("=== setup_server start: {}@{} ===", creds.username, creds.ip);
+
     let mkdir_cmd = format!(
         "mkdir -p {} {} {} {}",
         REMOTE_BIN_DIR, REMOTE_CONFIG_DIR, REMOTE_DATA_DIR, REMOTE_LOGS_DIR
     );
+    m_core::log_info!("Step 1: creating remote directories");
     run_ssh_command(creds, &mkdir_cmd).await?;
 
+    m_core::log_info!("Step 2: removing existing server");
     remove_server(creds).await?;
 
+    m_core::log_info!("Step 3: recreating remote directories");
     run_ssh_command(creds, &mkdir_cmd).await?;
 
+    m_core::log_info!("Step 4: uploading files (binary + config)");
     upload_files(creds, user_key, admin_key).await?;
 
+    m_core::log_info!("Step 5: checking binary dependencies (ldd)");
     let ldd_cmd = format!("ldd {}", REMOTE_BINARY_PATH);
     run_ssh_command(creds, &ldd_cmd).await?;
 
+    m_core::log_info!("Step 6: starting server with nohup");
     let run_command = format!("nohup {}", REMOTE_BINARY_PATH);
     run_ssh_command(creds, &run_command).await?;
 
+    m_core::log_info!("Step 7: waiting 2s then checking process");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let ps_cmd = format!("ps aux | grep {} | grep -v grep", REMOTE_BINARY_PATH);
     run_ssh_command(creds, &ps_cmd).await?;
 
-    m_core::log_info!("Server successfully setup and started");
+    m_core::log_info!("=== Server successfully setup and started ===");
     Ok(())
 }
