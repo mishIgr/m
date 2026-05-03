@@ -31,4 +31,22 @@ if [ ! -f "$CLIENT_CONFIG/client.toml" ]; then
     cp config/client.toml "$CLIENT_CONFIG/client.toml"
 fi
 
+if [[ ":$PATH:" != *":$CLIENT_BIN:"* ]]; then
+    SHELL_RC=""
+    if [ -n "$BASH_VERSION" ]; then
+        SHELL_RC="$HOME/.bashrc"
+    elif [ -n "$ZSH_VERSION" ]; then
+        SHELL_RC="$HOME/.zshrc"
+    fi
+    
+    if [ -n "$SHELL_RC" ] && [ -f "$SHELL_RC" ]; then
+        echo "export PATH=\"$CLIENT_BIN:\$PATH\"" >> "$SHELL_RC"
+        echo "Added $CLIENT_BIN to PATH in $SHELL_RC"
+        echo "Please run: source $SHELL_RC or restart your terminal"
+    else
+        echo "Please add $CLIENT_BIN to your PATH manually:"
+        echo "export PATH=\"$CLIENT_BIN:\$PATH\""
+    fi
+fi
+
 echo "Successful installation"
