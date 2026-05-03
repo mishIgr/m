@@ -278,7 +278,7 @@ pub async fn setup_server(creds: &SshCredentials, user_key: &str, admin_key: &st
     run_ssh_command(creds, &ldd_cmd).await?;
 
     m_core::log_info!("Step 6: starting server with nohup");
-    let run_command = format!("nohup {}", REMOTE_BINARY_PATH);
+    let run_command = format!("nohup {} {}", REMOTE_BINARY_PATH, REMOTE_CONFIG_PATH);
     run_ssh_command(creds, &run_command).await?;
 
     m_core::log_info!("Step 7: waiting 2s then checking process");
