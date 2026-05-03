@@ -73,8 +73,8 @@ async fn run_ssh_command(creds: &SshCredentials, remote_cmd: &str) -> io::Result
         .await?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr).replace('\r', "");
+        let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
 
         // Filter out SSH informational warnings (host key notices etc.)
         let real_errors: Vec<&str> = stderr
@@ -149,10 +149,10 @@ async fn upload_file_scp(
         .await?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr).replace('\r', "");
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("Error uploading file {}: {}", local_path, stderr),
+            format!("SCP failed: {}", stderr.trim()),
         ));
     }
 
