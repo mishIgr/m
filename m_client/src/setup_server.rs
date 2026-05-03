@@ -75,16 +75,34 @@ async fn run_ssh_command(creds: &SshCredentials, remote_cmd: &str) -> io::Result
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Filter out SSH informational warnings (host key notices etc.)
+        let real_errors: Vec<&str> = stderr
+            .lines()
+            .filter(|l| !l.starts_with("Warning:") && !l.starts_with("Warning "))
+            .collect();
+        let real_stderr = real_errors.join("\n");
+
         m_core::log_error!(
-            "SSH command failed [{}]: {}\n  stdout: {}\n  stderr: {}",
+            "SSH command failed [{}] (exit: {:?}): {}\n  stdout: {}\n  stderr: {}",
             target,
+            output.status.code(),
             remote_cmd,
             stdout.trim(),
             stderr.trim()
         );
+
+        let detail = if !real_stderr.trim().is_empty() {
+            real_stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("exit code {:?}", output.status.code())
+        };
+
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("SSH command failed: {}", stderr.trim()),
+            format!("SSH failed: {}", detail),
         ));
     }
 
