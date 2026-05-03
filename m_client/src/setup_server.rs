@@ -54,6 +54,40 @@ async fn check_sshpass() -> io::Result<()> {
     Ok(())
 }
 
+async fn try_ssh_command(creds: &SshCredentials, remote_cmd: &str) {
+    let target = format!("{}@{}", creds.username, creds.ip);
+    m_core::log_info!("SSH (optional) [{}]: {}", target, remote_cmd);
+
+    let output = Command::new("sshpass")
+        .arg("-p")
+        .arg(&creds.password)
+        .arg("ssh")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg(&target)
+        .arg(remote_cmd)
+        .stdin(Stdio::null())
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if !o.status.success() => {
+            m_core::log_info!(
+                "SSH (optional) [{}] exit {:?}: {}",
+                target,
+                o.status.code(),
+                remote_cmd
+            );
+        }
+        Err(e) => {
+            m_core::log_info!("SSH (optional) [{}] error: {}", target, e);
+        }
+        _ => {}
+    }
+}
+
 async fn run_ssh_command(creds: &SshCredentials, remote_cmd: &str) -> io::Result<()> {
     let target = format!("{}@{}", creds.username, creds.ip);
     m_core::log_info!("SSH [{}]: {}", target, remote_cmd);
@@ -164,8 +198,7 @@ pub async fn remove_server(creds: &SshCredentials) -> io::Result<()> {
     let stop_cmd = format!(
         "pid=$(pgrep -x m_server 2>/dev/null); [ -n \"$pid\" ] && kill $pid && sleep 1 || true"
     );
-    // Best-effort: SSH may exit 255 if pkill kills the sshd child process
-    let _ = run_ssh_command(creds, &stop_cmd).await;
+    try_ssh_command(creds, &stop_cmd).await;
 
     let remove_binary_cmd = format!("rm -f {}", REMOTE_BINARY_PATH);
 
