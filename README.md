@@ -31,7 +31,9 @@ bind_address = "0.0.0.0:50051"      # optional — this is the default
 path = "~/.local/share/m/db.redb"
 
 [logging]
-path = "~/.local/share/m/logs/"
+log_dir       = "~/.local/share/m/logs/"
+max_files     = 5
+max_file_size = 10485760             # bytes
 
 [delivery]
 ack_timeout_secs    = 10
@@ -45,13 +47,14 @@ dedup_cache_size    = 10000
 [encryption]
 user_key  = "<32 bytes as hex>"     # AES-256-GCM key for gRPC transport encryption
 admin_key = "<32 bytes as hex>"     # key required for admin operations
+server_id = <u128 decimal>          # unique server identifier
 ```
 
 - `user_key` must match `shared_key` in the client's server card.
 - `admin_key` must match `admin_key` in the client's server card.
 - Both keys are 32 bytes encoded as a 64-character lowercase hex string.
 
-See [`config/server.toml`](config/server.toml) for a working example.
+See [`config/server.template.toml`](config/server.template.toml) for a working example.
 
 ### Running
 
@@ -72,7 +75,9 @@ The client reads its own TOML config. Pass the path with `--config` (default: `~
 db_path = "~/.local/share/m/client.redb"
 
 [logging]
-path = "~/.local/share/m/client-logs/"
+log_dir       = "~/.local/share/m/client-logs/"
+max_files     = 5
+max_file_size = 10485760
 ```
 
 See [`config/client.toml`](config/client.toml) for an example.
@@ -131,6 +136,10 @@ In **contacts** and **servers** windows use ↑/↓ arrows to move the cursor th
 └────────────────────────────────────────┘
 ```
 
+In **live mode** the prompt changes to `message>` and pressing Enter sends a message directly.
+Use PageUp / PageDown to scroll the message panel. Messages from contacts with Dilithium2
+signatures show a verification badge: `✓` verified, `?` cannot verify, `✗` tampered.
+
 #### share
 
 ```
@@ -182,9 +191,7 @@ In **contacts** and **servers** windows use ↑/↓ arrows to move the cursor th
 | `disable` | Disable selected server and disconnect |
 | `rename <new_name>` | Rename selected server |
 | `del` | Delete selected server |
-| `import <path>` | Import server from a binary card file |
-| `export <path>` | Export selected server to a binary card file |
-| `deploy <user> <ip> <pass>` | Deploy server via SSH (auto-generates keys) |
+| `deploy <user> <ip> <pass> <name>` | Deploy server via SSH (auto-generates keys) |
 | `remove <user> <ip> <pass>` | Remove server via SSH and delete locally |
 | `admin create-chat <id>` | Create chat on server, generate encryption key, save locally |
 | `admin delete-chat <id>` | Delete a chat from the selected server |
@@ -197,16 +204,19 @@ Navigate here with `chats` from the servers window. The prompt shows `servers/ch
 | Command | Description |
 |---|---|
 | ↑ / ↓ | Move cursor |
+| `set-name <name>` | Set your display name (used in outgoing messages) |
 | `live` | Enter live mode for selected chat (right panel shows messages) |
 | ESC | Exit live mode |
 | `enable` | Enable selected chat |
 | `disable` | Disable selected chat |
 | `rename <new_name>` | Rename selected chat |
 | `del` | Delete selected chat |
-| `import <path>` | Import chat from a binary card file |
-| `export <path>` | Export selected chat to a binary card file |
+| `verify` | Toggle Dilithium2 signature mode on/off for selected chat |
 | `send <message>` | Send message to selected (or live) chat |
 | `history [--limit N]` | Fetch message history (default 50) |
+| `admin create-chat <name>` | Create chat on server, generate encryption key, save locally |
+| `admin delete-chat <id>` | Delete a chat from the server |
+| `admin list-chats` | List all chats on the server |
 
 ### share window
 
@@ -216,6 +226,9 @@ Navigate here with `chats` from the servers window. The prompt shows `servers/ch
 | `stop-tor` | Stop Tor daemon |
 | `receiving-data` | Start onion listener — prints received items live; ESC to stop |
 | `share-data` | Interactive wizard: pick contact → server → chat, then send |
+| `gen-offer <contact> <path>` | Generate KEM offer file — step 1 of manual file-based share (you are B) |
+| `respond-offer <contact> <offer> <response>` | Respond to an offer file — step 2 (you are A); writes a response file |
+| `load-response <contact> <path>` | Import response file — step 3 (you are B); merges shared data |
 
 ---
 
@@ -226,17 +239,10 @@ Navigate here with `chats` from the servers window. The prompt shows `servers/ch
 **Deploy via SSH** (server binary must be installed on the remote host):
 
 ```
-servers> deploy root 192.168.1.10 mypassword
-Server 'srv-a1b2c3d4' deployed
+servers> deploy root 192.168.1.10 mypassword my-server
+Server 'my-server' (<hex-id>) deployed
   user_key:  <hex>
   admin_key: <hex>
-```
-
-**Or import a binary card** exported from another client:
-
-```
-servers> import ~/server.card
-Server 'remote' imported
 ```
 
 ### 2. Create a chat (admin)
@@ -259,11 +265,7 @@ servers/chats> enable
 servers/chats> live
 ```
 
-Other users can receive the chat via `share-data` / `receiving-data` or by importing an exported card:
-
-```
-servers/chats> export ~/general.card      # share out-of-band
-```
+Other users can receive the chat via `share-data` / `receiving-data` (see the share workflow below) or via the manual KEM file flow (`gen-offer` / `respond-offer` / `load-response`).
 
 ### 4. Send a message
 
@@ -337,10 +339,10 @@ The server never sees plaintext messages or chat encryption keys.
 
 ## Binary card format
 
-Server and chat credentials are exchanged as binary files (bincode-serialised structs), not TOML. Generate them with `export` in the servers/chats windows, import with `import`.
+Credentials are exchanged as binary files (bincode-serialised structs). Server and chat data is shared via the `share-data` wizard or the manual KEM flow (`gen-offer` / `respond-offer` / `load-response`). Contact cards are exported with `export-self` / `export` and imported with `load` in the contacts window.
 
 | File | Contains |
 |---|---|
-| Server card | `id`, `address`, `shared_key`, `admin_key` (optional) |
+| Server card | `id`, `name`, `address`, `shared_key`, `admin_key` (optional) |
 | Chat card | `server_id`, `chat_id`, `name`, `encryption_key` |
 | Contact card | `signing_pk`, `tor_pk`, `onion_address` |
