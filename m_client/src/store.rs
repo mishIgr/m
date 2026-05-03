@@ -138,17 +138,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn export_server_card(&self, id: u128) -> Result<ServerCard> {
-        let r = self.load_server(id)?;
-        Ok(ServerCard {
-            id: r.id,
-            name: r.name,
-            address: r.address,
-            shared_key: r.shared_key_bytes,
-            admin_key: r.admin_key_bytes,
-        })
-    }
-
     pub fn load_server(&self, id: u128) -> Result<ServerRecord> {
         let table = self.db.table::<String, ServerRecord>(SERVER_TABLE)?;
         table.get(&id_key(id))?
@@ -204,16 +193,6 @@ impl Store {
         let table = self.db.table::<String, ChatRecord>(CHATS_TABLE)?;
         table.put(&key, &record)?;
         Ok(())
-    }
-
-    pub fn export_chat_card(&self, server_id: u128, chat_id: u128) -> Result<ChatCard> {
-        let r = self.load_chat(server_id, chat_id)?;
-        Ok(ChatCard {
-            server_id: r.server_id,
-            chat_id: r.chat_id,
-            name: r.name,
-            encryption_key: r.encryption_key_bytes,
-        })
     }
 
     pub fn load_chat(&self, server_id: u128, chat_id: u128) -> Result<ChatRecord> {

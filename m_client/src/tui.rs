@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use m_core::crypto::AsymmetricCipher;
 use m_core::crypto::algorithms::signature::Dilithium2;
 
-use crate::config::{ServerCard, ChatCard};
+use crate::config::ServerCard;
 use crate::connection_manager::ConnectionManager;
 use crate::identity::ContactCard;
 use crate::live::LiveEvent;
@@ -406,8 +406,6 @@ async fn exec_servers(
                 "  rename <name>          Rename selected server".into(),
                 "  del                    Delete selected server".into(),
                 "  chats                  Go to chats of selected server".into(),
-                "  import <path>          Import server from binary file".into(),
-                "  export <path>          Export selected server to binary file".into(),
                 "  deploy <user> <ip> <pass> <name>  Deploy server via SSH".into(),
                 "  remove <user> <ip> <pass>  Remove server via SSH".into(),
                 "  admin create-chat <id> Create chat on server, generate key, save locally".into(),
@@ -473,42 +471,6 @@ async fn exec_servers(
                 app.set_error(format!("Error: {e}")); return;
             }
             refresh_servers(app, store);
-        }
-        "import" => {
-            if words.len() < 2 {
-                app.set_error("Usage: import <path>"); return;
-            }
-            let path_str = shellexpand::tilde(words[1]);
-            match ServerCard::load(std::path::Path::new(path_str.as_ref())) {
-                Ok(card) => {
-                    let id = card.id.clone();
-                    match store.save_server_card(&card) {
-                        Ok(()) => {
-                            refresh_servers(app, store);
-                            app.set_info(vec![format!("Server '{}' imported", id)]);
-                        }
-                        Err(e) => app.set_error(format!("Save error: {e}")),
-                    }
-                }
-                Err(e) => app.set_error(format!("Load error: {e}")),
-            }
-        }
-        "export" => {
-            if words.len() < 2 {
-                app.set_error("Usage: export <path>"); return;
-            }
-            if app.servers.is_empty() {
-                app.set_error("No servers"); return;
-            }
-            let id = app.servers[app.servers_cursor].id;
-            let path_str = shellexpand::tilde(words[1]);
-            match store.export_server_card(id) {
-                Ok(card) => match card.save(std::path::Path::new(path_str.as_ref())) {
-                    Ok(()) => app.set_info(vec![format!("Exported server '{}' to {}", id, path_str)]),
-                    Err(e) => app.set_error(format!("Write error: {e}")),
-                },
-                Err(e) => app.set_error(format!("Error: {e}")),
-            }
         }
         "deploy" => {
             if words.len() < 5 {
@@ -679,8 +641,6 @@ async fn exec_chats(
                 "  live                   Enter live mode for selected chat".into(),
                 "  send <message>         Send message to selected chat".into(),
                 "  history [--limit N]    Fetch chat history".into(),
-                "  import <path>          Import chat from binary file".into(),
-                "  export <path>          Export selected chat to binary file".into(),
                 "  admin create-chat <id> Create chat on server, generate key, save locally".into(),
                 "  admin delete-chat <id> Delete chat on server".into(),
                 "  admin list-chats       List chats on server".into(),
@@ -773,42 +733,6 @@ async fn exec_chats(
                 }
             }
             refresh_chats(app, store);
-        }
-        "import" => {
-            if words.len() < 2 {
-                app.set_error("Usage: import <path>"); return;
-            }
-            let path_str = shellexpand::tilde(words[1]);
-            match ChatCard::load(std::path::Path::new(path_str.as_ref())) {
-                Ok(card) => {
-                    let display = format!("{}/{}", card.server_id, card.chat_id);
-                    match store.save_chat_card(&card) {
-                        Ok(()) => {
-                            refresh_chats(app, store);
-                            app.set_info(vec![format!("Chat '{}' imported", display)]);
-                        }
-                        Err(e) => app.set_error(format!("Save error: {e}")),
-                    }
-                }
-                Err(e) => app.set_error(format!("Load error: {e}")),
-            }
-        }
-        "export" => {
-            if words.len() < 2 {
-                app.set_error("Usage: export <path>"); return;
-            }
-            if app.chats.is_empty() {
-                app.set_error("No chats"); return;
-            }
-            let chat_id = app.chats[app.chats_cursor].chat_id;
-            let path_str = shellexpand::tilde(words[1]);
-            match store.export_chat_card(server_id, chat_id) {
-                Ok(card) => match card.save(std::path::Path::new(path_str.as_ref())) {
-                    Ok(()) => app.set_info(vec![format!("Exported chat '{}/{}' to {}", server_id, chat_id, path_str)]),
-                    Err(e) => app.set_error(format!("Write error: {e}")),
-                },
-                Err(e) => app.set_error(format!("Error: {e}")),
-            }
         }
         "send" => {
             let parts: Vec<&str> = input.splitn(2, ' ').collect();
@@ -1848,7 +1772,7 @@ fn draw_servers(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     if app.servers.is_empty() {
-        let hint = Paragraph::new("No servers. Use 'import <path>' or 'deploy <user> <ip> <pass>'.")
+        let hint = Paragraph::new("No servers. Use 'deploy <user> <ip> <pass> <name>' to add one.")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(hint, inner);
         return;
@@ -1922,7 +1846,7 @@ fn draw_chats(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(left_block, cols[0]);
 
     if app.chats.is_empty() {
-        let hint = Paragraph::new("No chats.\n'import <path>'")
+        let hint = Paragraph::new("No chats.\nUse 'admin create-chat <id>' to create one.")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(hint, left_inner);
     } else {

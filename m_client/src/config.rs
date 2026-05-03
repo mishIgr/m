@@ -39,66 +39,10 @@ pub struct ServerCard {
     pub admin_key: Option<Vec<u8>>,
 }
 
-impl ServerCard {
-    pub fn id_hex(&self) -> String {
-        format!("{:032x}", self.id)
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        Ok(bincode::serialize(self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Ok(bincode::deserialize(bytes)?)
-    }
-
-    pub fn load(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("Failed to read server card: {}", path.display()))?;
-        Self::from_bytes(&bytes)
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let bytes = self.to_bytes()?;
-        std::fs::write(path, bytes)
-            .with_context(|| format!("Failed to write server card: {}", path.display()))
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCard {
     pub server_id: u128,
     pub chat_id: u128,
     pub name: String,
     pub encryption_key: Vec<u8>,
-}
-
-impl ChatCard {
-    pub fn server_id_hex(&self) -> String {
-        format!("{:032x}", self.server_id)
-    }
-
-    pub fn chat_id_hex(&self) -> String {
-        format!("{:032x}", self.chat_id)
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        Ok(bincode::serialize(self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Ok(bincode::deserialize(bytes)?)
-    }
-
-    pub fn load(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("Failed to read chat card: {}", path.display()))?;
-        Self::from_bytes(&bytes)
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let bytes = self.to_bytes()?;
-        std::fs::write(path, bytes)
-            .with_context(|| format!("Failed to write chat card: {}", path.display()))
-    }
 }
