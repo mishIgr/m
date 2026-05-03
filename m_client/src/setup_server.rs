@@ -161,8 +161,11 @@ async fn upload_file_scp(
 }
 
 pub async fn remove_server(creds: &SshCredentials) -> io::Result<()> {
-    let stop_cmd = format!("pkill -f {} || true", REMOTE_BINARY_PATH);
-    run_ssh_command(creds, &stop_cmd).await?;
+    let stop_cmd = format!(
+        "pid=$(pgrep -x m_server 2>/dev/null); [ -n \"$pid\" ] && kill $pid && sleep 1 || true"
+    );
+    // Best-effort: SSH may exit 255 if pkill kills the sshd child process
+    let _ = run_ssh_command(creds, &stop_cmd).await;
 
     let remove_binary_cmd = format!("rm -f {}", REMOTE_BINARY_PATH);
 
