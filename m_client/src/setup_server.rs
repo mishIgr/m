@@ -44,7 +44,7 @@ impl SshCredentials {
 }
 
 async fn check_sshpass() -> io::Result<()> {
-    let status = Command::new("which").arg("sshpass").status().await?;
+    let status = Command::new("which").arg("sshpass").stdout(Stdio::null()).status().await?;
     if !status.success() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
