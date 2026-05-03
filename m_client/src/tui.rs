@@ -82,7 +82,6 @@ enum TorStatus {
 // ── File-based share context ─────────────────────────────────────────────────
 
 struct FileShareContext {
-    contact_id: String,
     offer_path: String,
     response_path: String,
 }
@@ -1140,7 +1139,6 @@ async fn exec_share(
             let servers = store.list_servers().unwrap_or_default();
             if servers.is_empty() { app.set_error("No servers configured"); return; }
             app.file_share_context = Some(FileShareContext {
-                contact_id: contact_id.to_string(),
                 offer_path: offer_path.to_string(),
                 response_path: response_path.to_string(),
             });
