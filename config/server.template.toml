@@ -21,3 +21,4 @@ dedup_cache_size = 10000
 [encryption]
 user_key = "{{USER_KEY}}"
 admin_key = "{{ADMIN_KEY}}"
+server_id = {{SERVER_ID}}

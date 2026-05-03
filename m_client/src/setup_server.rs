@@ -151,11 +151,13 @@ async fn upload_config(creds: &SshCredentials, user_key: &str, admin_key: &str) 
         e
     })?;
 
+    let server_id: u128 = rand::random();
     let config_content = template
         .replace("{{DB_PATH}}", REMOTE_DB_PATH)
         .replace("{{LOGS_DIR}}", REMOTE_LOGS_DIR)
         .replace("{{USER_KEY}}", user_key)
-        .replace("{{ADMIN_KEY}}", admin_key);
+        .replace("{{ADMIN_KEY}}", admin_key)
+        .replace("{{SERVER_ID}}", &server_id.to_string());
 
     let escaped = config_content.replace("'", "'\\''");
     let cmd = format!("echo '{}' > {}", escaped, REMOTE_CONFIG_PATH);
