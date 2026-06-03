@@ -5,10 +5,9 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use m_core::proto::*;
-use m_core::crypto::{CryptoKey, AsymmetricCipher};
-use m_core::crypto::algorithms::signature::Dilithium2;
-use m_core::crypto::key::Key;
 
+use crate::message_payload::{parse_payload, verify_message_sig};
+use crate::message_seq::accept_forward_seq;
 use crate::sharing::ShareData;
 use crate::store::{ChatRecord, Store, StoredMessage, VerificationStatus};
 use crate::transport::{self, chat_id_bytes, chat_id_from_bytes, decrypt_payload, make_envelope, parse_server_event};
@@ -23,36 +22,6 @@ pub struct LiveMessage {
     pub timestamp: String,
     pub timestamp_ms: i64,
     pub verification: VerificationStatus,
-}
-
-fn parse_payload(raw: &str) -> (String, String, String, Option<Vec<u8>>) {
-    let parts: Vec<&str> = raw.splitn(4, '\x1e').collect();
-    if parts.len() == 4 {
-        let sig = hex::decode(parts[3]).ok();
-        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string(), sig)
-    } else if parts.len() == 3 {
-        (parts[0].to_string(), parts[1].to_string(), parts[2].to_string(), None)
-    } else {
-        (String::new(), String::new(), raw.to_string(), None)
-    }
-}
-
-fn verify_message_sig(store: &Store, sender_id: &str, chat_id: u128, text: &str, sig: &[u8]) -> VerificationStatus {
-    let sign_material = format!("{:032x}\x1e{}\x1e{}", chat_id, sender_id, text);
-    match store.load_contact(sender_id) {
-        Ok(contact) => {
-            let pk: Key<{ Dilithium2::PUBLIC_KEY_SIZE }> =
-                match CryptoKey::from_bytes(&contact.signing_pk_bytes) {
-                    Ok(k) => k,
-                    Err(_) => return VerificationStatus::CannotVerify,
-                };
-            match Dilithium2::verify_detached(&pk, sign_material.as_bytes(), sig) {
-                Ok(true) => VerificationStatus::Verified,
-                _ => VerificationStatus::Tampered,
-            }
-        }
-        Err(_) => VerificationStatus::CannotVerify,
-    }
 }
 
 pub enum LiveEvent {
@@ -73,6 +42,7 @@ pub async fn subscribe(
     store: Store,
     cancel: CancellationToken,
     event_tx: mpsc::UnboundedSender<LiveEvent>,
+    max_forward_seq: u128,
 ) -> Result<()> {
     m_core::log_info!("live: connecting to server={:032x} address={} chats={}", server_id, address, chats.len());
     for (id, rec) in chats {
@@ -189,43 +159,103 @@ pub async fn subscribe(
                             None => continue,
                         };
 
-                        let (sender_id, sender_name, text, sig_opt) = parse_payload(&raw);
-
-                        let verification = match &sig_opt {
-                            Some(sig) => verify_message_sig(&store, &sender_id, chat_id, &text, sig),
-                            None => VerificationStatus::NoSignature,
-                        };
-
-                        let ts = match chrono::DateTime::from_timestamp_millis(msg.timestamp_ms) {
-                            Some(dt) => dt.format("%H:%M").to_string(),
-                            None => {
-                                m_core::log_warn!("live: invalid timestamp_ms={} server={:032x} chat={:032x}, using raw value", msg.timestamp_ms, server_id, chat_id);
-                                msg.timestamp_ms.to_string()
+                        let Some(parsed) = parse_payload(&raw) else {
+                            m_core::log_warn!(
+                                "live: invalid message payload server={:032x} chat={:032x} ts={}",
+                                server_id, chat_id, msg.timestamp_ms
+                            );
+                            // fall through to ACK
+                            let ack = ClientEvent {
+                                event: Some(client_event::Event::Ack(MessageAck {
+                                    chat_id: msg.chat_id.clone(),
+                                    timestamp_ms: msg.timestamp_ms as u64,
+                                })),
+                            };
+                            if let Ok(env) = make_envelope(&cipher, &ack) {
+                                let _ = tx.send(env).await;
                             }
+                            continue;
                         };
 
-                        if let Err(e) = store.save_message(&StoredMessage {
-                            chat_id,
-                            message_id: msg.message_id.clone(),
-                            timestamp_ms: msg.timestamp_ms,
-                            text: text.clone(),
-                            sender: Some(format!("{}\x1e{}", sender_id, sender_name)),
-                            verification: verification.clone(),
-                        }) {
-                            m_core::log_warn!("live: save_message failed server={:032x} chat={:032x} ts={} error={}", server_id, chat_id, msg.timestamp_ms, e);
+                        let last_seq = store.last_peer_seq(chat_id, &parsed.sender_id).ok().flatten();
+                        if !accept_forward_seq(last_seq, parsed.message_seq, max_forward_seq) {
+                            m_core::log_warn!(
+                                "live: seq rejected sender={} chat={:032x} seq={} last={:?} max_spread={}",
+                                parsed.sender_id, chat_id, parsed.message_seq, last_seq, max_forward_seq
+                            );
+                            // ACK and discard
+                            let ack = ClientEvent {
+                                event: Some(client_event::Event::Ack(MessageAck {
+                                    chat_id: msg.chat_id.clone(),
+                                    timestamp_ms: msg.timestamp_ms as u64,
+                                })),
+                            };
+                            if let Ok(env) = make_envelope(&cipher, &ack) {
+                                let _ = tx.send(env).await;
+                            }
+                            continue;
                         }
 
-                        let _ = event_tx.send(LiveEvent::Message(LiveMessage {
-                            server_id,
-                            chat_id,
-                            chat_name,
-                            sender_id,
-                            sender_name,
-                            text,
-                            timestamp: ts,
-                            timestamp_ms: msg.timestamp_ms,
-                            verification,
-                        }));
+                        let duplicate = store
+                            .has_client_message(chat_id, &parsed.client_message_id)
+                            .unwrap_or(false);
+
+                        if duplicate {
+                            m_core::log_debug!(
+                                "live: duplicate client_message_id={} chat={:032x}, skipping display",
+                                parsed.client_message_id, chat_id
+                            );
+                        } else {
+                            let verification = match &parsed.signature {
+                                Some(sig) => verify_message_sig(
+                                    &store,
+                                    &parsed.sender_id,
+                                    chat_id,
+                                    &parsed.text,
+                                    &parsed.client_message_id,
+                                    parsed.message_seq,
+                                    sig,
+                                ),
+                                None => VerificationStatus::NoSignature,
+                            };
+
+                            let ts = match chrono::DateTime::from_timestamp_millis(msg.timestamp_ms) {
+                                Some(dt) => dt.format("%H:%M").to_string(),
+                                None => {
+                                    m_core::log_warn!("live: invalid timestamp_ms={} server={:032x} chat={:032x}, using raw value", msg.timestamp_ms, server_id, chat_id);
+                                    msg.timestamp_ms.to_string()
+                                }
+                            };
+
+                            if let Err(e) = store.save_message(&StoredMessage {
+                                chat_id,
+                                message_id: msg.message_id.clone(),
+                                timestamp_ms: msg.timestamp_ms,
+                                text: parsed.text.clone(),
+                                client_message_id: parsed.client_message_id.clone(),
+                                message_seq: parsed.message_seq,
+                                sender: Some(format!("{}\x1e{}", parsed.sender_id, parsed.sender_name)),
+                                verification: verification.clone(),
+                            }) {
+                                m_core::log_warn!("live: save_message failed server={:032x} chat={:032x} ts={} error={}", server_id, chat_id, msg.timestamp_ms, e);
+                            } else {
+                                if let Err(e) = store.set_last_peer_seq(chat_id, &parsed.sender_id, parsed.message_seq) {
+                                    m_core::log_warn!("live: set_last_peer_seq failed sender={} chat={:032x}: {}", parsed.sender_id, chat_id, e);
+                                }
+                            }
+
+                            let _ = event_tx.send(LiveEvent::Message(LiveMessage {
+                                server_id,
+                                chat_id,
+                                chat_name: chat_name.clone(),
+                                sender_id: parsed.sender_id,
+                                sender_name: parsed.sender_name,
+                                text: parsed.text,
+                                timestamp: ts,
+                                timestamp_ms: msg.timestamp_ms,
+                                verification,
+                            }));
+                        }
 
                         let ack = ClientEvent {
                             event: Some(client_event::Event::Ack(MessageAck {

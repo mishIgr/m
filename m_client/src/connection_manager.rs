@@ -10,14 +10,16 @@ pub struct ConnectionManager {
     store: Store,
     event_tx: mpsc::UnboundedSender<LiveEvent>,
     cancels: HashMap<u128, CancellationToken>,
+    max_forward_seq: u128,
 }
 
 impl ConnectionManager {
-    pub fn new(store: Store, event_tx: mpsc::UnboundedSender<LiveEvent>) -> Self {
+    pub fn new(store: Store, event_tx: mpsc::UnboundedSender<LiveEvent>, max_forward_seq: u128) -> Self {
         Self {
             store,
             event_tx,
             cancels: HashMap::new(),
+            max_forward_seq,
         }
     }
 
@@ -68,10 +70,11 @@ impl ConnectionManager {
         let key = shared_key_bytes.to_vec();
         let store = self.store.clone();
         let event_tx = self.event_tx.clone();
+        let max_forward_seq = self.max_forward_seq;
 
         tokio::spawn(async move {
             m_core::log_debug!("connection_manager: live task started server={:032x}", server_id);
-            match live::subscribe(server_id, &addr, &key, &chat_pairs, store, cancel, event_tx).await {
+            match live::subscribe(server_id, &addr, &key, &chat_pairs, store, cancel, event_tx, max_forward_seq).await {
                 Ok(()) => { m_core::log_debug!("connection_manager: live task exited cleanly server={:032x}", server_id) }
                 Err(e) => m_core::log_error!("connection_manager: live task exited with error server={:032x}: {}", server_id, e),
             }

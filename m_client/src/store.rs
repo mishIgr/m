@@ -16,6 +16,8 @@ const CHATS_TABLE: &str = "chats";
 const MESSAGES_TABLE_PREFIX: &str = "messages:";
 const IDENTITY_TABLE: &str = "identity";
 const CONTACTS_TABLE: &str = "contacts";
+const OUTGOING_SEQ_TABLE: &str = "outgoing_seq";
+const PEER_SEQ_TABLE: &str = "peer_seq";
 
 fn id_key(id: u128) -> String {
     format!("{:032x}", id)
@@ -83,10 +85,16 @@ pub struct StoredMessage {
     pub message_id: String,
     pub timestamp_ms: i64,
     pub text: String,
+    pub client_message_id: String,
+    pub message_seq: u128,
     #[serde(default)]
     pub sender: Option<String>,
     #[serde(default)]
     pub verification: VerificationStatus,
+}
+
+fn peer_seq_key(chat_id: u128, sender_id: &str) -> String {
+    format!("{:032x}:{}", chat_id, sender_id)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,12 +278,47 @@ impl Store {
         Ok(())
     }
 
+    pub fn has_client_message(&self, chat_id: u128, client_message_id: &str) -> Result<bool> {
+        let table_name = msg_table_name(chat_id);
+        let table = self.db.table::<i64, StoredMessage>(&table_name)?;
+        for (_, msg) in table.iter()? {
+            if !msg.client_message_id.is_empty()
+                && msg.client_message_id == client_message_id
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn get_messages(&self, chat_id: u128, limit: usize) -> Result<Vec<StoredMessage>> {
         let table_name = msg_table_name(chat_id);
         let table = self.db.table::<i64, StoredMessage>(&table_name)?;
         let all: Vec<StoredMessage> = table.iter()?.into_iter().map(|(_, v)| v).collect();
         let start = all.len().saturating_sub(limit);
         Ok(all[start..].to_vec())
+    }
+
+    // ── Message sequence counters ─────────────────────────────────────────────
+
+    /// Returns the next outgoing sequence number for `chat_id` (starts at 1).
+    pub fn allocate_outgoing_seq(&self, chat_id: u128) -> Result<u128> {
+        let table = self.db.table::<String, u128>(OUTGOING_SEQ_TABLE)?;
+        let key = id_key(chat_id);
+        let next = table.get(&key)?.unwrap_or(1);
+        table.put(&key, &(next + 1))?;
+        Ok(next)
+    }
+
+    pub fn last_peer_seq(&self, chat_id: u128, sender_id: &str) -> Result<Option<u128>> {
+        let table = self.db.table::<String, u128>(PEER_SEQ_TABLE)?;
+        Ok(table.get(&peer_seq_key(chat_id, sender_id))?)
+    }
+
+    pub fn set_last_peer_seq(&self, chat_id: u128, sender_id: &str, seq: u128) -> Result<()> {
+        let table = self.db.table::<String, u128>(PEER_SEQ_TABLE)?;
+        table.put(&peer_seq_key(chat_id, sender_id), &seq)?;
+        Ok(())
     }
 
     // ── Identity ──────────────────────────────────────────────────────────────

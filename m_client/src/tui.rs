@@ -17,10 +17,9 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use m_core::crypto::AsymmetricCipher;
-use m_core::crypto::algorithms::signature::Dilithium2;
-
-use crate::config::ServerCard;
+use crate::config::{MessagesConfig, ServerCard};
+use crate::message_payload::{build_payload, parse_payload};
+use crate::message_seq::accept_forward_seq;
 use crate::connection_manager::ConnectionManager;
 use crate::identity::ContactCard;
 use crate::live::LiveEvent;
@@ -203,6 +202,7 @@ async fn execute_command(
     manager: &mut ConnectionManager,
     event_tx: &mpsc::UnboundedSender<LiveEvent>,
     share_state: &mut Option<(CancellationToken, Option<tokio::process::Child>)>,
+    max_forward_seq: u128,
 ) -> bool /* quit */ {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -238,7 +238,7 @@ async fn execute_command(
         Screen::Contacts => exec_contacts(trimmed, &words, app, store).await,
         Screen::Servers  => exec_servers(trimmed, &words, app, store, manager, event_tx, share_state).await,
         Screen::Chats { server_id } => {
-            exec_chats(trimmed, &words, *server_id, app, store, manager).await
+            exec_chats(trimmed, &words, *server_id, app, store, manager, max_forward_seq).await
         }
         Screen::Share => exec_share(trimmed, &words, app, store, event_tx, share_state).await,
     }
@@ -627,6 +627,7 @@ async fn exec_chats(
     app: &mut App,
     store: &Store,
     manager: &mut ConnectionManager,
+    max_forward_seq: u128,
 ) {
     let cmd = words[0].to_lowercase();
     match cmd.as_str() {
@@ -756,7 +757,10 @@ async fn exec_chats(
                 Ok(c) => c,
                 Err(e) => { app.set_error(format!("Error: {e}")); return; }
             };
-            let payload = build_payload(&app.my_id, &app.my_name, message, chat_id, chat.verification_mode, store);
+            let payload = match build_payload(&app.my_id, &app.my_name, message, chat_id, chat.verification_mode, store) {
+                Ok(p) => p,
+                Err(e) => { app.set_error(format!("Payload error: {e}")); return; }
+            };
             match Transport::connect(&server.address, &server.shared_key_bytes).await {
                 Ok(mut t) => match t.send_message(chat_id, &payload, &chat.encryption_key_bytes).await {
                     Ok(r) if r.accepted => {}
@@ -820,14 +824,15 @@ async fn exec_chats(
                                 &chat.encryption_key_bytes,
                                 msg_chat_id,
                             ).unwrap_or_else(|_| "<decryption failed>".into());
-                            let (sid, sname, text) = {
-                                let mut parts = raw.splitn(3, '\x1e');
-                                let a = parts.next().unwrap_or("").to_string();
-                                let b = parts.next().unwrap_or("").to_string();
-                                let c = parts.next().map(|s| s.to_string()).unwrap_or_else(|| raw.clone());
-                                if raw.contains('\x1e') { (a, b, c) } else { (String::new(), String::new(), raw) }
-                            };
-                            let display = resolve_sender_name(&app.contacts, &sid, &sname);
+                            let Some(parsed) = parse_payload(&raw) else { continue };
+                            let last_seq = store.last_peer_seq(chat_id, &parsed.sender_id).ok().flatten();
+                            if !accept_forward_seq(last_seq, parsed.message_seq, max_forward_seq) {
+                                continue;
+                            }
+                            if store.has_client_message(chat_id, &parsed.client_message_id).unwrap_or(false) {
+                                continue;
+                            }
+                            let display = resolve_sender_name(&app.contacts, &parsed.sender_id, &parsed.sender_name);
                             let date = msg_date(msg.timestamp_ms);
                             if !date.is_empty() && hist_last_date.as_deref() != Some(date.as_str()) {
                                 lines.push(date_separator(&date));
@@ -836,7 +841,7 @@ async fn exec_chats(
                             let ts = chrono::DateTime::from_timestamp_millis(msg.timestamp_ms)
                                 .map(|dt| dt.format("%H:%M").to_string())
                                 .unwrap_or_else(|| msg.timestamp_ms.to_string());
-                            lines.push(format!("[{ts}] {display}: {text}"));
+                            lines.push(format!("[{ts}] {display}: {}", parsed.text));
                         }
                         if lines.is_empty() {
                             app.set_info(vec!["No messages".into()]);
@@ -1259,14 +1264,14 @@ fn new_aes_key_bytes() -> Vec<u8> {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub async fn run(store: Store) -> Result<()> {
+pub async fn run(store: Store, messages_cfg: MessagesConfig) -> Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_inner(&mut terminal, store).await;
+    let result = run_inner(&mut terminal, store, messages_cfg).await;
 
     terminal::disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
@@ -1278,6 +1283,7 @@ pub async fn run(store: Store) -> Result<()> {
 async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     store: Store,
+    messages_cfg: MessagesConfig,
 ) -> Result<()> {
     m_core::log_info!("tui: starting");
     let mut app = App::new();
@@ -1288,7 +1294,8 @@ async fn run_inner(
     refresh_contacts(&mut app, &store);
 
     let (live_event_tx, mut live_event_rx) = mpsc::unbounded_channel::<LiveEvent>();
-    let mut manager = ConnectionManager::new(store.clone(), live_event_tx.clone());
+    let max_forward_seq = messages_cfg.max_forward_seq;
+    let mut manager = ConnectionManager::new(store.clone(), live_event_tx.clone(), max_forward_seq);
     let mut share_state: Option<(CancellationToken, Option<tokio::process::Child>)> = None;
 
     if let Err(e) = manager.start_all_enabled() {
@@ -1403,7 +1410,10 @@ async fn run_inner(
                                 Ok(server) => match store.load_chat(sid, cid) {
                                     Ok(chat) => match Transport::connect(&server.address, &server.shared_key_bytes).await {
                                         Ok(mut t) => {
-                                            let payload = build_payload(&my_id, &my_name, &input, cid, chat.verification_mode, &store);
+                                            let payload = match build_payload(&my_id, &my_name, &input, cid, chat.verification_mode, &store) {
+                                                Ok(p) => p,
+                                                Err(e) => { app.set_error(format!("Payload error: {e}")); continue; }
+                                            };
                                             match t.send_message(cid, &payload, &chat.encryption_key_bytes).await {
                                                 Ok(r) if r.accepted => {}
                                                 Ok(r) => app.set_error(format!("Rejected: {}", r.error)),
@@ -1422,6 +1432,7 @@ async fn run_inner(
                         let quit = execute_command(
                             &input, &mut app, &store, &mut manager,
                             &live_event_tx, &mut share_state,
+                            max_forward_seq,
                         ).await;
                         if quit {
                             cleanup_and_quit(&mut app, &mut manager, &mut share_state).await;
@@ -1546,24 +1557,6 @@ fn resolve_sender_name(contacts: &[ContactRecord], sender_id: &str, sender_name:
         sender_id[..sender_id.len().min(8)].to_string()
     } else {
         "?".to_string()
-    }
-}
-
-fn build_payload(my_id: &str, my_name: &str, text: &str, chat_id: u128, verification_mode: bool, store: &Store) -> String {
-    let base = format!("{}\x1e{}\x1e{}", my_id, my_name, text);
-    if !verification_mode { return base; }
-    let Ok(Some(identity)) = store.load_identity() else { return base; };
-    let (Ok(sk), Ok(pk)) = (
-        m_core::crypto::CryptoKey::from_bytes(&identity.signing_sk_bytes),
-        m_core::crypto::CryptoKey::from_bytes(&identity.signing_pk_bytes),
-    ) else { return base; };
-    let mut signer = Dilithium2::new();
-    signer.set_secret(sk);
-    signer.set_public(pk);
-    let sign_material = format!("{:032x}\x1e{}\x1e{}", chat_id, my_id, text);
-    match signer.sign_detached(sign_material.as_bytes()) {
-        Ok(sig) => format!("{}\x1e{}", base, hex::encode(&sig)),
-        Err(_) => base,
     }
 }
 

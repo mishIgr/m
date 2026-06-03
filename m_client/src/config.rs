@@ -7,10 +7,30 @@ fn expand(s: &str) -> String {
     shellexpand::tilde(s).into_owned()
 }
 
+fn default_max_forward_seq() -> u128 {
+    1000
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MessagesConfig {
+    #[serde(default = "default_max_forward_seq")]
+    pub max_forward_seq: u128,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClientConfig {
     pub storage: StorageConfig,
     pub logging: LoggerConfig,
+    #[serde(default)]
+    pub messages: MessagesConfig,
+}
+
+impl Default for MessagesConfig {
+    fn default() -> Self {
+        Self {
+            max_forward_seq: default_max_forward_seq(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

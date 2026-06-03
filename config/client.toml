@@ -1,6 +1,9 @@
 [storage]
 db_path = "~/.local/share/m/client.redb"
 
+[messages]
+max_forward_seq = 1000
+
 [logging]
 log_dir = "~/.local/share/m/client-logs/"
 max_files = 5

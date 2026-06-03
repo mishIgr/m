@@ -1,5 +1,7 @@
 mod config;
 mod connection_manager;
+mod message_payload;
+mod message_seq;
 mod store;
 mod transport;
 mod live;
@@ -63,5 +65,5 @@ async fn main() -> Result<()> {
         panic!("Error init logger, error: {}", err);
     }
 
-    tui::run(store).await
+    tui::run(store, config.messages).await
 }
