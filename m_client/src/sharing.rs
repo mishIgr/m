@@ -74,7 +74,16 @@ pub fn encode_frame<T: Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
     Ok(frame)
 }
 
-/// Deserialize a bincode body (without the length prefix).
+/// Deserialize a frame produced by `encode_frame`: strip the 4-byte big-endian
+/// length header, validate it against the remaining bytes, then bincode-decode.
 pub fn decode_frame<T: for<'de> Deserialize<'de>>(data: &[u8]) -> anyhow::Result<T> {
-    Ok(bincode::deserialize(data)?)
+    if data.len() < 4 {
+        anyhow::bail!("frame too short: {} bytes", data.len());
+    }
+    let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let body = &data[4..];
+    if body.len() != len {
+        anyhow::bail!("frame length mismatch: header says {len}, got {}", body.len());
+    }
+    Ok(bincode::deserialize(body)?)
 }
