@@ -74,9 +74,21 @@ pub fn encode_frame<T: Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
     Ok(frame)
 }
 
-/// Deserialize a frame produced by `encode_frame`: strip the 4-byte big-endian
-/// length header, validate it against the remaining bytes, then bincode-decode.
+/// Deserialize a bincode body (without the length prefix).
+///
+/// Used on the streaming path, where `read_frame` has already consumed and
+/// stripped the 4-byte length header. For a whole buffer that still carries the
+/// header (e.g. a file written by `encode_frame`), use `decode_framed` instead.
 pub fn decode_frame<T: for<'de> Deserialize<'de>>(data: &[u8]) -> anyhow::Result<T> {
+    Ok(bincode::deserialize(data)?)
+}
+
+/// Deserialize a complete frame produced by `encode_frame`: validate and strip
+/// the 4-byte big-endian length header, then bincode-decode the body.
+///
+/// Use this when you hold the entire frame in memory (e.g. file contents),
+/// rather than reading it off a stream via `read_frame`.
+pub fn decode_framed<T: for<'de> Deserialize<'de>>(data: &[u8]) -> anyhow::Result<T> {
     if data.len() < 4 {
         anyhow::bail!("frame too short: {} bytes", data.len());
     }
@@ -85,5 +97,5 @@ pub fn decode_frame<T: for<'de> Deserialize<'de>>(data: &[u8]) -> anyhow::Result
     if body.len() != len {
         anyhow::bail!("frame length mismatch: header says {len}, got {}", body.len());
     }
-    Ok(bincode::deserialize(body)?)
+    decode_frame(body)
 }

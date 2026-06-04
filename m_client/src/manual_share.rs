@@ -13,7 +13,7 @@ use m_core::crypto::algorithms::signature::Dilithium2;
 use m_core::crypto::algorithms::symmetric::Aes256Gcm;
 use m_core::crypto::key::Key;
 
-use crate::sharing::{KemOffer, SharePacket, ShareData, encode_frame, decode_frame};
+use crate::sharing::{KemOffer, SharePacket, ShareData, encode_frame, decode_framed};
 use crate::store::{Store, IdentityRecord, ContactRecord};
 
 fn derive_aes_key(shared_secret: &[u8]) -> Result<Aes256Gcm> {
@@ -83,7 +83,7 @@ pub fn create_share_response(
     contact: &ContactRecord,
     store: &Store,
 ) -> Result<Vec<u8>> {
-    let kem_offer: KemOffer = decode_frame(offer_bytes)?;
+    let kem_offer: KemOffer = decode_framed(offer_bytes)?;
 
     let contact_pk = build_verifier(contact)?;
     let valid = Dilithium2::verify(&contact_pk, &kem_offer.kem_pk, &kem_offer.signature)
@@ -132,7 +132,7 @@ pub fn load_share_response(
     store: &Store,
 ) -> Result<ShareData> {
     let _ = identity; // identity not needed for decapsulation, but kept for API symmetry
-    let packet: SharePacket = decode_frame(response_bytes)?;
+    let packet: SharePacket = decode_framed(response_bytes)?;
 
     let contact_pk = build_verifier(contact)?;
     let packet_sign_msg = concat_for_sign(&[&packet.kem_ct, &packet.ciphertext, &packet.nonce]);
